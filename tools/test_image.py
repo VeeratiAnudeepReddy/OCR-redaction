@@ -1,0 +1,334 @@
+"""
+tools/test_image.py  —  CLI test harness for the Redaction backend.
+
+Sends a local image to the running backend at http://127.0.0.1:5005/process-image
+and prints a clean, human-readable privacy report.
+
+Usage:
+    python tools/test_image.py /path/to/image.png
+    python tools/test_image.py ~/Desktop/my_screenshot.png
+
+The script never constructs, prints, or infers raw PII.
+It only displays the safe_text and entity metadata returned by the backend.
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+import pathlib
+from typing import Any
+
+# ── Optional rich terminal output (graceful fallback if not installed) ────────
+try:
+    import requests
+    from requests.exceptions import ConnectionError as ReqConnectionError
+    from requests.exceptions import Timeout, RequestException
+except ImportError:  # pragma: no cover
+    print("ERROR: 'requests' is not installed. Run: pip install requests", file=sys.stderr)
+    sys.exit(1)
+
+# ── Constants ─────────────────────────────────────────────────────────────────
+
+BACKEND_URL = "http://127.0.0.1:5005/process-image"
+BACKEND_BASE = "http://127.0.0.1:5005"
+TIMEOUT_SECONDS = 30
+
+SUPPORTED_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
+SUPPORTED_MIMES = {"image/png", "image/jpeg", "image/webp"}
+
+LINE = "=" * 60
+DIVIDER = "-" * 60
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _fmt_size(size_bytes: int) -> str:
+    """Format byte count as a human-readable string."""
+    if size_bytes < 1024:
+        return f"{size_bytes} B"
+    if size_bytes < 1024 * 1024:
+        return f"{size_bytes / 1024:.0f} KB"
+    return f"{size_bytes / (1024 * 1024):.1f} MB"
+
+
+def _guess_type(path: pathlib.Path) -> str:
+    """Return a short file-type label from the extension."""
+    return path.suffix.lstrip(".").upper() or "UNKNOWN"
+
+
+def _header(title: str) -> None:
+    print(LINE)
+    print(title.center(60))
+    print(LINE)
+
+
+def _section(title: str) -> None:
+    print()
+    print(DIVIDER)
+    print(title)
+    print(DIVIDER)
+
+
+def _ok(msg: str) -> None:
+    print(f"  \u2713 {msg}")
+
+
+def _fail(msg: str) -> None:
+    print(f"  \u2717 {msg}")
+
+
+# ── Validation ────────────────────────────────────────────────────────────────
+
+def validate_image_path(raw_path: str) -> pathlib.Path:
+    """
+    Resolve and validate the supplied image path.
+
+    Returns the resolved Path on success.
+    Prints an error and calls sys.exit(1) on failure — no traceback.
+    """
+    path = pathlib.Path(raw_path).expanduser().resolve()
+
+    if not path.exists():
+        _header("         REDACTION IMAGE TEST")
+        print()
+        print("ERROR:")
+        print(f"  File not found: {raw_path}")
+        print()
+        print("FAIL \u2717")
+        print(LINE)
+        sys.exit(1)
+
+    if not path.is_file():
+        _header("         REDACTION IMAGE TEST")
+        print()
+        print("ERROR:")
+        print(f"  Path is not a file: {path}")
+        print()
+        print("FAIL \u2717")
+        print(LINE)
+        sys.exit(1)
+
+    ext = path.suffix.lower()
+    if ext not in SUPPORTED_EXTENSIONS:
+        _header("         REDACTION IMAGE TEST")
+        print()
+        print("ERROR:")
+        print(f"  Unsupported file type: '{ext}'")
+        print(f"  Supported: {', '.join(sorted(SUPPORTED_EXTENSIONS))}")
+        print()
+        print("FAIL \u2717")
+        print(LINE)
+        sys.exit(1)
+
+    return path
+
+
+# ── HTTP call ─────────────────────────────────────────────────────────────────
+
+def call_backend(image_path: pathlib.Path) -> dict[str, Any]:
+    """
+    POST the image to the backend and return the parsed JSON response.
+
+    Raises:
+        SystemExit(1) for connection errors or non-recoverable HTTP errors,
+        printing a clean error report instead of a traceback.
+    """
+    try:
+        with image_path.open("rb") as fh:
+            response = requests.post(
+                BACKEND_URL,
+                files={"image": (image_path.name, fh, "image/png")},
+                timeout=TIMEOUT_SECONDS,
+            )
+    except (ReqConnectionError, OSError):
+        _header("         REDACTION IMAGE TEST")
+        print()
+        print("ERROR:")
+        print("  Could not connect to the Redaction backend.")
+        print()
+        print("Backend:")
+        print(f"  {BACKEND_BASE}")
+        print()
+        print("Start it with:")
+        print("  python backend/app.py")
+        print()
+        print("FAIL \u2717")
+        print(LINE)
+        sys.exit(1)
+    except Timeout:
+        _header("         REDACTION IMAGE TEST")
+        print()
+        print("ERROR:")
+        print(f"  Request timed out after {TIMEOUT_SECONDS}s.")
+        print(f"  The backend at {BACKEND_BASE} is not responding.")
+        print()
+        print("FAIL \u2717")
+        print(LINE)
+        sys.exit(1)
+    except RequestException as exc:
+        _header("         REDACTION IMAGE TEST")
+        print()
+        print("ERROR:")
+        print(f"  Unexpected network error: {type(exc).__name__}")
+        print()
+        print("FAIL \u2717")
+        print(LINE)
+        sys.exit(1)
+
+    # HTTP error statuses
+    if response.status_code != 200:
+        _header("         REDACTION IMAGE TEST")
+        print()
+        print("ERROR:")
+        print(f"  Backend returned HTTP {response.status_code}.")
+        try:
+            detail = response.json().get("error", "No detail provided.")
+        except Exception:
+            detail = response.text[:200] or "No body."
+        print(f"  Detail: {detail}")
+        print()
+        print("FAIL \u2717")
+        print(LINE)
+        sys.exit(1)
+
+    # Parse JSON
+    try:
+        data = response.json()
+    except Exception:
+        _header("         REDACTION IMAGE TEST")
+        print()
+        print("ERROR:")
+        print("  Backend returned malformed JSON.")
+        print()
+        print("FAIL \u2717")
+        print(LINE)
+        sys.exit(1)
+
+    return data
+
+
+# ── Report renderer ───────────────────────────────────────────────────────────
+
+def render_report(image_path: pathlib.Path, data: dict[str, Any]) -> bool:
+    """
+    Print the full human-readable report.
+
+    Returns True if the response represents a successful result, False otherwise.
+    """
+    success: bool = bool(data.get("success", False))
+    safe_text: str = data.get("safe_text", "")
+    entities: list[dict] = data.get("entities_found", [])
+
+    file_size = image_path.stat().st_size
+    file_type = _guess_type(image_path)
+
+    # ── Header ────────────────────────────────────────────────────────────────
+    _header("         REDACTION IMAGE TEST")
+
+    print()
+    print("Image:")
+    print(f"  {image_path}")
+    print()
+    print("File:")
+    print(f"  Name: {image_path.name}")
+    print(f"  Size: {_fmt_size(file_size)}")
+    print(f"  Type: {file_type}")
+
+    # ── Safe text ─────────────────────────────────────────────────────────────
+    _section("OCR / SAFE TEXT RESULT")
+    print()
+    if safe_text and safe_text.strip():
+        for line in safe_text.splitlines():
+            print(f"  {line}")
+    else:
+        print("  (no text extracted)")
+
+    # ── Entities ──────────────────────────────────────────────────────────────
+    _section("DETECTED PII ENTITIES")
+    print()
+    if entities:
+        print(f"  Total entities detected: {len(entities)}")
+        print()
+        for i, entity in enumerate(entities, start=1):
+            entity_type = entity.get("type", "UNKNOWN")
+            score = entity.get("score", 0.0)
+            print(f"  {i}. {entity_type}")
+            print(f"     Confidence: {score:.2f}")
+    else:
+        print("  No PII entities detected.")
+
+    # ── Privacy check ─────────────────────────────────────────────────────────
+    _section("PRIVACY CHECK")
+    print()
+    if success:
+        _ok("Processing successful")
+        _ok("Safe text generated")
+        _ok("PII detection completed")
+    else:
+        error_msg = data.get("error", "Unknown error")
+        _fail(f"Processing failed: {error_msg}")
+
+    # ── Final result ──────────────────────────────────────────────────────────
+    _section("FINAL RESULT")
+    print()
+    if success:
+        print("PASS \u2713")
+    else:
+        print("FAIL \u2717")
+    print()
+    print(LINE)
+
+    return success
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+
+def main(argv: list[str] | None = None) -> int:
+    """
+    Main entry point.
+
+    Args:
+        argv: Argument list (defaults to sys.argv[1:] when None).
+
+    Returns:
+        0 on success, 1 on failure.
+    """
+    parser = argparse.ArgumentParser(
+        prog="test_image",
+        description="Send a local image to the Redaction backend and display a privacy report.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Examples:\n"
+            "  python tools/test_image.py test_data/test_input.png\n"
+            "  python tools/test_image.py ~/Desktop/my_screenshot.png\n"
+        ),
+    )
+    parser.add_argument(
+        "image_path",
+        metavar="IMAGE_PATH",
+        help="Path to the image file (PNG, JPEG, or WEBP).",
+    )
+    parser.add_argument(
+        "--url",
+        default=BACKEND_URL,
+        metavar="URL",
+        help=f"Backend endpoint URL (default: {BACKEND_URL}).",
+    )
+
+    args = parser.parse_args(argv)
+
+    # Step 1 — validate path
+    image_path = validate_image_path(args.image_path)
+
+    # Step 2 — call backend
+    data = call_backend(image_path)
+
+    # Step 3 — render report
+    success = render_report(image_path, data)
+
+    return 0 if success else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
