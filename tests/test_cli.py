@@ -131,8 +131,9 @@ class TestValidateImagePath:
         buf = io.BytesIO()
         img.save(buf, format="PNG")
         p.write_bytes(buf.getvalue())
-        # monkeypatch HOME so ~ resolves to tmp_path
+        # monkeypatch HOME and USERPROFILE so ~ resolves to tmp_path cross-platform
         monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("USERPROFILE", str(tmp_path))
         result = validate_image_path("~/home.png")
         assert result.name == "home.png"
 
