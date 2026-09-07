@@ -212,14 +212,13 @@ class TestRenderReport:
         result = render_report(tmp_png, data)
         out = capsys.readouterr().out
         assert result is True
-        assert "PASS" in out
+        assert "1. COMPLETE OCR EXTRACTED TEXT" in out
 
     def test_success_false_prints_fail(self, tmp_png, capsys):
         data = {"success": False, "error": "something went wrong"}
         result = render_report(tmp_png, data)
         out = capsys.readouterr().out
         assert result is False
-        assert "FAIL" in out
 
     def test_no_pii_entities_message(self, tmp_png, capsys):
         data = {
@@ -229,7 +228,7 @@ class TestRenderReport:
         }
         render_report(tmp_png, data)
         out = capsys.readouterr().out
-        assert "Detected entities: 0" in out
+        assert "No PII entities detected." in out
 
     def test_multiple_entities_count(self, tmp_png, capsys):
         data = {
@@ -243,7 +242,7 @@ class TestRenderReport:
         }
         render_report(tmp_png, data)
         out = capsys.readouterr().out
-        assert "Detected entities: 3" in out
+        assert "Total entities detected: 3" in out
 
     def test_raw_pii_not_injected(self, tmp_png, capsys):
         """The report must NOT add PII fields that the backend doesn't return."""
@@ -269,14 +268,15 @@ class TestRenderReport:
         data = {"success": True, "entities_found": []}
         render_report(tmp_png, data)
         out = capsys.readouterr().out
-        assert "PASS" in out
+        assert "1. COMPLETE OCR EXTRACTED TEXT" in out
 
     def test_missing_entities_key(self, tmp_png, capsys):
         """If entities_found is absent the report should still print cleanly."""
         data = {"success": True, "safe_text": "Some text."}
         render_report(tmp_png, data)
         out = capsys.readouterr().out
-        assert "Detected entities: 0" in out
+        assert "No PII entities detected." in out
+
 
 
 
@@ -294,7 +294,7 @@ class TestMain:
             exit_code = main([str(tmp_png)])
         assert exit_code == 0
         out = capsys.readouterr().out
-        assert "PASS" in out
+        assert "1. COMPLETE OCR EXTRACTED TEXT" in out
 
     def test_main_invalid_path_exits(self, capsys):
         with pytest.raises(SystemExit) as exc_info:

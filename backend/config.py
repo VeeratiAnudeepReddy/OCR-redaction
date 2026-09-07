@@ -49,7 +49,8 @@ ENTITIES_TO_DETECT: list[str] = [
     "US_SSN",
     "IP_ADDRESS",
     "URL",
-    "USERNAME",       # Custom: label-prefixed usernames (e.g. "Username: bob99")
+    "USERNAME",       # Custom: label-prefixed / context-aware usernames
+    "PASSWORD",       # Custom: context-aware passwords
     "SOCIAL_HANDLE",  # Custom: bare @handles (e.g. "@dev_jane")
 ]
 
@@ -66,6 +67,7 @@ ANONYMIZATION_LABELS: dict[str, str] = {
     "IP_ADDRESS":    "[IP_ADDRESS]",
     "URL":           "[URL]",
     "USERNAME":      "[USERNAME]",   # Custom recognizer
+    "PASSWORD":      "[PASSWORD]",   # Custom recognizer
     "SOCIAL_HANDLE": "[HANDLE]",     # Custom recognizer
 }
 DEFAULT_REDACTION_LABEL: str = "[REDACTED]"

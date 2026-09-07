@@ -20,34 +20,151 @@ import logging
 from dataclasses import dataclass, field
 from typing import List, Optional
 
-from presidio_analyzer import AnalyzerEngine, Pattern, PatternRecognizer, RecognizerResult
+import re
+from presidio_analyzer import AnalyzerEngine, EntityRecognizer, Pattern, PatternRecognizer, RecognizerResult
 from presidio_anonymizer import AnonymizerEngine
 from presidio_anonymizer.entities import OperatorConfig
 
 import backend.config as config
+from backend.ocr import OCRWord
 
 logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Custom PatternRecognizer definitions
+# Custom Context-Aware Recognizers
 # ---------------------------------------------------------------------------
 
+class CredentialRecognizer(EntityRecognizer):
+    """
+    Context-aware recogniser for USERNAME and PASSWORD credentials.
+
+    Uses label proximity (same line or next line) and spatial layout to detect
+    credentials associated with form labels while avoiding false positives on
+    help text, links, or standalone headers.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            supported_entities=["USERNAME", "PASSWORD"],
+            name="credential_context_recognizer",
+        )
+        self.username_labels = [
+            "username", "user name", "login id", "user id", "email address",
+            "account name", "email", "user", "login", "account",
+        ]
+        self.password_labels = [
+            "password", "passcode", "passward", "pasword", "possword", "pwd", "secret",
+        ]
+        self.exclusion_keywords = [
+            "forgot", "reset", "remember", "change", "don't have", "dont have",
+            "register", "sign up", "credentials", "copyright", "rights reserved",
+            "click here", "interviews", "enter your", "confirm",
+        ]
+
+    def _is_excluded(self, text: str) -> bool:
+        lower = text.lower()
+        return any(ex in lower for ex in self.exclusion_keywords)
+
+    def _is_label_match(self, text: str, label_list: list[str]) -> bool:
+        lower = text.lower()
+        for lbl in label_list:
+            if re.search(r"\b" + re.escape(lbl) + r"\b", lower):
+                return True
+        return False
+
+    def analyze(self, text: str, entities: list[str], nlp_artifacts=None) -> list[RecognizerResult]:
+        if not text or not text.strip():
+            return []
+
+        results: list[RecognizerResult] = []
+        target_entities = set(entities) if entities else {"USERNAME", "PASSWORD"}
+        want_username = "USERNAME" in target_entities
+        want_password = "PASSWORD" in target_entities
+
+        if not (want_username or want_password):
+            return []
+
+        lines = text.splitlines()
+        line_offsets: list[tuple[str, int, int]] = []
+        offset = 0
+        for l in lines:
+            line_offsets.append((l, offset, offset + len(l)))
+            offset += len(l) + 1  # newline
+
+        all_labels = self.username_labels + self.password_labels
+
+        for idx, (line_str, l_start, l_end) in enumerate(line_offsets):
+            if self._is_excluded(line_str):
+                continue
+
+            u_label = want_username and self._is_label_match(line_str, self.username_labels)
+            p_label = want_password and self._is_label_match(line_str, self.password_labels)
+
+            if not (u_label or p_label):
+                continue
+
+            target_type = "USERNAME" if u_label else "PASSWORD"
+            active_labels = self.username_labels if u_label else self.password_labels
+
+            # 1. Inline check (same line value)
+            inline_found = False
+            for lbl in active_labels:
+                pattern = r"\b" + re.escape(lbl) + r"\b\s*[:\-=?*]*\s*(.+)"
+                m = re.search(pattern, line_str, re.IGNORECASE)
+                if m:
+                    candidate = m.group(1).strip()
+                    candidate_clean = candidate.strip("?:;=|*")
+                    if (
+                        sum(c.isalnum() for c in candidate_clean) >= 2
+                        and not self._is_excluded(candidate)
+                        and not self._is_label_match(candidate, all_labels)
+                    ):
+                        rel_start = line_str.find(candidate_clean, m.start(1))
+                        v_start = l_start + rel_start
+                        v_end = v_start + len(candidate_clean)
+                        results.append(
+                            RecognizerResult(
+                                entity_type=target_type,
+                                start=v_start,
+                                end=v_end,
+                                score=0.85,
+                            )
+                        )
+                        inline_found = True
+                        break
+
+            if inline_found:
+                continue
+
+            # 2. Stacked check (next line value)
+            if idx + 1 < len(line_offsets):
+                next_line_str, n_start, n_end = line_offsets[idx + 1]
+                if (
+                    next_line_str.strip()
+                    and not self._is_excluded(next_line_str)
+                    and not self._is_label_match(next_line_str, all_labels)
+                ):
+                    words = next_line_str.strip().split()
+                    if words:
+                        first_word = words[0].rstrip("|")
+                        if sum(c.isalnum() for c in first_word) >= 2:
+                            w_rel_start = next_line_str.find(first_word)
+                            w_start = n_start + w_rel_start
+                            w_end = w_start + len(first_word)
+                            results.append(
+                                RecognizerResult(
+                                    entity_type=target_type,
+                                    start=w_start,
+                                    end=w_end,
+                                    score=0.85,
+                                )
+                            )
+
+        return results
+
+
 def _build_username_recognizer() -> PatternRecognizer:
-    """
-    Recogniser for label-prefixed username fields.
-
-    Matches text like:
-      - "Username: rahul_verma99"
-      - "User ID: admin_user01"
-      - "Handle: @dev_jane"
-      - "Login: bob.smith"
-      - "Screen Name: cool_user"
-      - "Account Name: service_account"
-
-    Conservative label requirement prevents false positives on arbitrary words.
-    Score of 0.85 reflects high confidence when a known label precedes the value.
-    """
     pattern = Pattern(
         name="username_label_pattern",
         regex=(
@@ -66,13 +183,6 @@ def _build_username_recognizer() -> PatternRecognizer:
 
 
 def _build_handle_recognizer() -> PatternRecognizer:
-    """
-    Recogniser for bare @handle mentions anywhere in text.
-
-    Matches text like "@dev_jane", "@rahul_99", "@sample_handle".
-    Score of 0.7 reflects high structural confidence (@ prefix is distinctive).
-    Minimum length of 3 avoids matching email @ symbols mid-word.
-    """
     pattern = Pattern(
         name="social_handle_pattern",
         regex=r"@[A-Za-z0-9_]{3,20}\b",
@@ -91,10 +201,6 @@ def _build_handle_recognizer() -> PatternRecognizer:
 def _build_analyzer() -> AnalyzerEngine:
     """
     Construct and return a configured AnalyzerEngine.
-
-    Uses the spaCy NLP engine backed by the configured model.
-    Custom PatternRecognizers for USERNAME and SOCIAL_HANDLE are registered
-    into the engine's registry before the engine is returned.
     """
     logger.info("Initialising Presidio AnalyzerEngine with spaCy model '%s' …", config.SPACY_MODEL)
     try:
@@ -109,17 +215,18 @@ def _build_analyzer() -> AnalyzerEngine:
         analyzer = AnalyzerEngine(nlp_engine=nlp_engine, supported_languages=["en"])
 
         # Register custom recognizers
-        analyzer.registry.add_recognizer(_build_username_recognizer())
+        analyzer.registry.add_recognizer(CredentialRecognizer())
         analyzer.registry.add_recognizer(_build_handle_recognizer())
 
         logger.info(
             "Presidio AnalyzerEngine initialised successfully. "
-            "Custom recognizers registered: USERNAME, SOCIAL_HANDLE."
+            "Custom recognizers registered: CredentialRecognizer, USERNAME, SOCIAL_HANDLE."
         )
         return analyzer
     except Exception as exc:  # noqa: BLE001
         logger.error("Failed to initialise AnalyzerEngine: %s", type(exc).__name__)
         raise
+
 
 
 def _build_anonymizer() -> AnonymizerEngine:
@@ -186,12 +293,13 @@ _OPERATORS: dict[str, OperatorConfig] = _build_operators()
 # Public API
 # ---------------------------------------------------------------------------
 
-def analyze_text(text: str) -> list[RecognizerResult]:
+def analyze_text(text: str, ocr_words: Optional[List[OCRWord]] = None) -> list[RecognizerResult]:
     """
     Run Presidio Analyzer on *text* and return raw recogniser results.
 
     Args:
         text: The text to analyse (may contain PII).
+        ocr_words: Optional structured word-level bounding box data from OCR.
 
     Returns:
         List of RecognizerResult objects above the configured threshold.
@@ -222,7 +330,6 @@ def analyze_text(text: str) -> list[RecognizerResult]:
     # Optional debug pass: log entity_type + score for candidates above the
     # debug threshold but below the production threshold, so developers can
     # tune sensitivity without changing production behaviour.
-    # Privacy guarantee: only entity_type and score are logged, never raw text.
     if config.PII_DEBUG_THRESHOLD >= 0.0:
         debug_candidates: list[RecognizerResult] = _analyzer.analyze(
             text=text,
@@ -274,12 +381,17 @@ def anonymize_text(text: str, analyzer_results: list[RecognizerResult]) -> str:
     return anonymized.text
 
 
-def process_text(text: str, debug_pii_report: Optional[bool] = None) -> AnalysisResult:
+def process_text(
+    text: str,
+    ocr_words: Optional[List[OCRWord]] = None,
+    debug_pii_report: Optional[bool] = None,
+) -> AnalysisResult:
     """
     High-level convenience function: detect + anonymise in one call.
 
     Args:
         text: Raw OCR text (may contain PII).
+        ocr_words: Optional word bounding boxes from OCR.
         debug_pii_report: Whether debug report mode is enabled to include raw PII values.
 
     Returns:
@@ -289,7 +401,7 @@ def process_text(text: str, debug_pii_report: Optional[bool] = None) -> Analysis
     if debug_pii_report is None:
         debug_pii_report = config.DEBUG_PII_REPORT
 
-    analyzer_results = analyze_text(text)
+    analyzer_results = analyze_text(text, ocr_words=ocr_words)
 
     safe_text = anonymize_text(text, analyzer_results)
 
@@ -305,5 +417,6 @@ def process_text(text: str, debug_pii_report: Optional[bool] = None) -> Analysis
     ]
 
     return AnalysisResult(safe_text=safe_text, entities=entities)
+
 
 

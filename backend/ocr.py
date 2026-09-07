@@ -16,12 +16,37 @@ from __future__ import annotations
 import logging
 import os
 import shutil
+from dataclasses import dataclass, field
 from typing import List, Tuple
 
 from PIL import Image, ImageEnhance, ImageFilter, ImageOps
 import pytesseract
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Public OCR Data Structures
+# ---------------------------------------------------------------------------
+
+@dataclass
+class OCRWord:
+    """Bounding box and line location of an OCR word."""
+    text: str
+    left: int
+    top: int
+    width: int
+    height: int
+    line_num: int
+    block_num: int = 0
+
+
+@dataclass
+class OCRResult:
+    """Structured OCR result containing full text and word-level bounding boxes."""
+    text: str
+    words: List[OCRWord] = field(default_factory=list)
+
 
 # ---------------------------------------------------------------------------
 # Tesseract binary auto-discovery (Windows fallback)
@@ -243,55 +268,54 @@ def _run_ocr(image: Image.Image, config_str: str, lang: str) -> Tuple[str, float
         return "", 0.0
 
 
-# ---------------------------------------------------------------------------
-# Public OCR entry-point
-# ---------------------------------------------------------------------------
+def _extract_words(image: Image.Image, lang: str, config_str: str) -> List[OCRWord]:
+    """Helper to extract OCRWord bounding boxes via image_to_data."""
+    try:
+        data = pytesseract.image_to_data(image, lang=lang, config=config_str, output_type=pytesseract.Output.DICT)
+        n = len(data.get("text", []))
+        words: List[OCRWord] = []
+        for i in range(n):
+            w_text = data["text"][i].strip()
+            if w_text:
+                words.append(
+                    OCRWord(
+                        text=w_text,
+                        left=data["left"][i],
+                        top=data["top"][i],
+                        width=data["width"][i],
+                        height=data["height"][i],
+                        line_num=data["line_num"][i],
+                        block_num=data.get("block_num", [0] * n)[i],
+                    )
+                )
+        return words
+    except Exception:  # noqa: BLE001
+        return []
 
-def extract_text_from_image(
+
+def extract_ocr_result(
     image: Image.Image,
     preprocess: bool = True,
     lang: str = "eng",
     tesseract_config: str = "--oem 3 --psm 6",
-) -> str:
+) -> OCRResult:
     """
-    Extract text from a PIL Image using Tesseract OCR.
-
-    When *preprocess* is ``True`` (default), the function generates 4 image
-    variants and tests each with 2 PSM modes (``--psm 6`` block / ``--psm 11``
-    sparse), picking the combination with the highest quality score.
-
-    When *preprocess* is ``False``, a single OCR pass is run on the raw image
-    using *tesseract_config* as supplied (backward-compatible).
-
-    Args:
-        image: A PIL Image object.
-        preprocess: Whether to run the multi-variant preprocessing pipeline.
-        lang: Tesseract language code(s), e.g. ``"eng"`` or ``"eng+fra"``.
-        tesseract_config: Tesseract flags used when ``preprocess=False`` or as
-            a fallback if all multi-variant attempts score 0.
+    Extract text and word-level bounding box data from a PIL Image.
 
     Returns:
-        Extracted text as a plain string.  May be empty if no text is found.
-
-    Raises:
-        pytesseract.TesseractNotFoundError: if the Tesseract binary is not installed.
-        RuntimeError: for unexpected OCR-related failures.
-
-    Privacy note:
-        Raw OCR text is NEVER logged.  Only aggregate metadata (character count,
-        winning variant label, quality score) is logged at INFO level.
+        :class:`OCRResult` containing full text string and structured word positions.
     """
     if not preprocess:
-        # ── Single-pass fallback (backward-compatible) ────────────────────────
         try:
             raw_text: str = pytesseract.image_to_string(
                 image, lang=lang, config=tesseract_config,
             )
+            words = _extract_words(image, lang=lang, config_str=tesseract_config)
             logger.info(
                 "OCR (single-pass) completed. Extracted %d characters (content not logged).",
                 len(raw_text.strip()),
             )
-            return raw_text
+            return OCRResult(text=raw_text, words=words)
         except pytesseract.TesseractNotFoundError:
             logger.error(
                 "Tesseract binary not found. Install Tesseract and ensure it is on PATH."
@@ -330,6 +354,8 @@ def extract_text_from_image(
     best_text: str = ""
     best_score: float = -1.0
     best_label: str = "none"
+    best_variant_img: Image.Image = image
+    best_cfg: str = tesseract_config
 
     for vi, variant_img in enumerate(variants):
         for cfg in _PSM_CONFIGS:
@@ -340,17 +366,42 @@ def extract_text_from_image(
                 best_score = score
                 best_text = text
                 best_label = label
+                best_variant_img = variant_img
+                best_cfg = cfg
 
     # If every variant scored 0, fall back to the standard preprocess_image path
     if best_score <= 0.0:
         fallback_img = preprocess_image(image)
         best_text, _ = _run_ocr(fallback_img, tesseract_config, lang)
         best_label = "fallback(preprocess_image)"
+        best_variant_img = fallback_img
+        best_cfg = tesseract_config
+
+    words = _extract_words(best_variant_img, lang=lang, config_str=best_cfg)
 
     logger.info(
-        "OCR (multi-variant) completed. Winner: %s | quality=%.3f | chars=%d.",
+        "OCR (multi-variant) completed. Winner: %s | quality=%.3f | chars=%d | words_found=%d.",
         best_label,
         max(best_score, 0.0),
         len(best_text.strip()),
+        len(words),
     )
-    return best_text
+    return OCRResult(text=best_text, words=words)
+
+
+def extract_text_from_image(
+    image: Image.Image,
+    preprocess: bool = True,
+    lang: str = "eng",
+    tesseract_config: str = "--oem 3 --psm 6",
+) -> str:
+    """
+    Extract text from a PIL Image using Tesseract OCR.
+    """
+    return extract_ocr_result(
+        image=image,
+        preprocess=preprocess,
+        lang=lang,
+        tesseract_config=tesseract_config,
+    ).text
+

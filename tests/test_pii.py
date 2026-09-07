@@ -322,3 +322,122 @@ class TestUsernameRecognizers:
                 f"safe_text: {result.safe_text!r}"
             )
 
+
+# ---------------------------------------------------------------------------
+# Required Tests for Context-Aware Credential Detection (USERNAME / PASSWORD)
+# ---------------------------------------------------------------------------
+
+def _make_png_bytes() -> bytes:
+    import io
+    from PIL import Image
+    img = Image.new("RGB", (100, 100), "white")
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+class TestContextAwareCredentialDetection:
+    """
+    Test suite verifying context-aware USERNAME and PASSWORD credential detection.
+    """
+
+    def test_username_label_and_value(self):
+        """1. Username label + value -> produces USERNAME entity."""
+        text = "Username: rahul_verma99"
+        results = analyze_text(text)
+        types = [r.entity_type for r in results]
+        assert "USERNAME" in types, f"USERNAME not detected in '{text}'"
+
+    def test_password_label_and_value(self):
+        """2. Password label + value -> produces PASSWORD entity."""
+        text = "Password: MySecretPass123!"
+        results = analyze_text(text)
+        types = [r.entity_type for r in results]
+        assert "PASSWORD" in types, f"PASSWORD not detected in '{text}'"
+
+    def test_username_and_password_together(self):
+        """3. Username + password together on one screen -> both entities detected."""
+        text = "Username: john_doe\nPassword: secret_password_99"
+        results = analyze_text(text)
+        types = [r.entity_type for r in results]
+        assert "USERNAME" in types
+        assert "PASSWORD" in types
+
+    def test_login_page_with_no_credential_values(self):
+        """4. Login page with no actual credential values -> no credential entities."""
+        text = "Login\nUsername:\nPassword:"
+        results = analyze_text(text)
+        cred_entities = [r for r in results if r.entity_type in ("USERNAME", "PASSWORD")]
+        assert cred_entities == [], f"Unexpected credential entities in empty form: {cred_entities}"
+
+    def test_ordinary_text_mentioning_password(self):
+        """5. Ordinary text mentioning 'password' with no value -> must NOT create a PASSWORD entity."""
+        text = "Forgot Username/Password?\nDon't have an account? Click here to register."
+        results = analyze_text(text)
+        cred_entities = [r for r in results if r.entity_type in ("USERNAME", "PASSWORD")]
+        assert cred_entities == [], f"FALSE POSITIVE credential entities detected: {cred_entities}"
+
+    def test_debug_pii_report_false_hides_credentials(self):
+        """6. DEBUG_PII_REPORT=false -> values hidden ([HIDDEN]) in report."""
+        text = "Username: testuser123\nPassword: secretpass123"
+        result = process_text(text, debug_pii_report=False)
+        for entity in result.entities:
+            assert entity.value is None, f"Raw value leaked in normal mode: {entity.value}"
+
+    def test_debug_pii_report_true_shows_credentials(self):
+        """7. DEBUG_PII_REPORT=true -> values visible ONLY in local CLI/report, never via API."""
+        text = "Username: testuser123\nPassword: secretpass123"
+        result = process_text(text, debug_pii_report=True)
+        u_val = next(e.value for e in result.entities if e.entity_type == "USERNAME")
+        p_val = next(e.value for e in result.entities if e.entity_type == "PASSWORD")
+        assert u_val == "testuser123"
+        assert p_val == "secretpass123"
+
+    def test_api_isolation_hides_raw_credentials(self):
+        """8. API isolation test -> confirm raw USERNAME/PASSWORD values never appear in /process-image JSON."""
+        import json
+        from backend.app import app as flask_app
+        with flask_app.test_client() as client:
+            resp = client.post(
+                "/process-image",
+                headers={"X-Debug-PII-Report": "true"},
+                data={"image": (_make_png_bytes(), "blank.png")},
+                content_type="multipart/form-data",
+            )
+            data = json.loads(resp.data)
+            for entity in data.get("entities_found", []):
+                assert "value" not in entity
+
+    def test_sanitized_output_tokens(self):
+        """9. Sanitized output test -> confirm credentials replaced with [USERNAME]/[PASSWORD] tokens."""
+        text = "Username: rahul_verma99\nPassword: MySecretPass123!"
+        result = process_text(text)
+        assert "rahul_verma99" not in result.safe_text
+        assert "MySecretPass123!" not in result.safe_text
+        assert "[USERNAME]" in result.safe_text
+        assert "[PASSWORD]" in result.safe_text
+
+    def test_login_screenshot_integration(self):
+        """10. Full integration test on test_data/login_screenshot.png."""
+        test_img = pathlib.Path(__file__).parent.parent / "test_data" / "login_screenshot.png"
+        if not test_img.exists():
+            pytest.skip("login_screenshot.png not found")
+
+        from PIL import Image
+        from backend.processor import process_image_object
+        img = Image.open(test_img)
+        result = process_image_object(img, debug_pii_report=True)
+
+        types = [e.entity_type for e in result.entities]
+        assert "USERNAME" in types, f"USERNAME not detected in login_screenshot. Found: {types}"
+        assert "PASSWORD" in types, f"PASSWORD not detected in login_screenshot. Found: {types}"
+
+        u_entity = next(e for e in result.entities if e.entity_type == "USERNAME")
+        p_entity = next(e for e in result.entities if e.entity_type == "PASSWORD")
+
+        assert "Asrithathota06" in u_entity.value
+        assert "asritha" in p_entity.value
+        assert "[USERNAME]" in result.safe_text
+        assert "[PASSWORD]" in result.safe_text
+
+

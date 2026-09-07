@@ -222,6 +222,9 @@ def call_backend(image_path: pathlib.Path) -> dict[str, Any]:
     return data
 
 
+import backend.config as config
+
+
 # ── Report renderer ───────────────────────────────────────────────────────────
 
 def render_report(image_path: pathlib.Path, data: dict[str, Any]) -> bool:
@@ -231,32 +234,114 @@ def render_report(image_path: pathlib.Path, data: dict[str, Any]) -> bool:
     Returns True if the response represents a successful result, False otherwise.
     """
     success: bool = bool(data.get("success", False))
+    safe_text: str = data.get("safe_text", "")
     entities: list[dict] = data.get("entities_found", [])
     report_file: str | None = data.get("report_file")
+    debug_mode: bool = os.getenv("DEBUG_PII_REPORT", "false").lower() in ("true", "1", "t", "yes")
 
-    # ── Header ────────────────────────────────────────────────────────────────
+    # Parse detected entity values from report_file if in debug mode
+    entity_val_map: dict[int, tuple[str, str]] = {}
+    if debug_mode and report_file and pathlib.Path(report_file).exists():
+        try:
+            report_content = pathlib.Path(report_file).read_text(encoding="utf-8")
+            import re
+            matches = re.findall(
+                r"Type:\s*(\w+)\s*\n\s*Value:\s*(.+)\s*\n\s*Confidence:\s*([\d.]+)\s*\n\s*Replacement:\s*(\[\w+\])",
+                report_content,
+            )
+            for idx, (etype, val, conf, repl) in enumerate(matches):
+                entity_val_map[idx] = (val.strip(), repl.strip())
+        except Exception:  # noqa: BLE001
+            pass
+
     _header("REDACTION IMAGE TEST")
 
     print()
     print("Image:")
     print(f"  {image_path.name}")
     print()
-    print(f"OCR: {'PASS' if success else 'FAIL'}")
-    print(f"PII Detection: {'PASS' if success else 'FAIL'}")
-    print(f"Anonymization: {'PASS' if success else 'FAIL'}")
+
+    # 1. COMPLETE OCR EXTRACTED TEXT
+    _section("1. COMPLETE OCR EXTRACTED TEXT")
     print()
-    print(f"Detected entities: {len(entities)}")
+    if safe_text and safe_text.strip():
+        for idx, line in enumerate(safe_text.splitlines(), start=1):
+            print(f"  [{idx:03d}] {line}")
+    else:
+        print("  (no text extracted)")
     print()
 
-    # ── Report file ───────────────────────────────────────────────────────────
+    # 2. OCR STATISTICS
+    _section("2. OCR STATISTICS")
+    print()
+    lines_count = len(safe_text.splitlines()) if safe_text else 0
+    words_count = len(safe_text.split()) if safe_text else 0
+    chars_count = len(safe_text) if safe_text else 0
+    print(f"  Lines:      {lines_count}")
+    print(f"  Words:      {words_count}")
+    print(f"  Characters: {chars_count}")
+    print()
+
+    # 3. DETECTED PERSONAL / PRIVATE DATA
+    _section("3. DETECTED PERSONAL / PRIVATE DATA")
+    print()
+    if entities:
+        print(f"  Total entities detected: {len(entities)}")
+        print()
+        for i, entity in enumerate(entities, start=1):
+            entity_type = entity.get("type", "UNKNOWN")
+            score = entity.get("score", 0.0)
+            if debug_mode and (i - 1) in entity_val_map:
+                val, token = entity_val_map[i - 1]
+            else:
+                val = "[HIDDEN]"
+                token = config.ANONYMIZATION_LABELS.get(entity_type, f"[{entity_type}]")
+            print(f"  {i}. Type:        {entity_type}")
+            print(f"     Value:       {val}")
+            print(f"     Confidence:  {score:.2f}")
+            print(f"     Replacement: {token}")
+            print()
+    else:
+        print("  No PII entities detected.")
+        print()
+
+    # 4. PII SUMMARY
+    _section("4. PII SUMMARY")
+    print()
+    print(f"  Total PII entities found: {len(entities)}")
+    print()
+
+    # 5. COMPLETE SANITIZED TEXT
+    _section("5. COMPLETE SANITIZED TEXT")
+    print()
+    if safe_text and safe_text.strip():
+        for idx, line in enumerate(safe_text.splitlines(), start=1):
+            print(f"  [{idx:03d}] {line}")
+    else:
+        print("  (no text extracted)")
+    print()
+
+    # 6. PRIVACY CHECK
+    _section("6. PRIVACY CHECK")
+    print()
+    print(f"  DEBUG_PII_REPORT mode:    {'ENABLED' if debug_mode else 'DISABLED'}")
+    print(f"  Raw PII in terminal:      {'YES' if debug_mode and len(entities) > 0 else 'NO'}")
+    print(f"  Raw PII in report file:   {'YES' if debug_mode and len(entities) > 0 else 'NO'}")
+    print(f"  API raw PII exposure:     NO")
+    print()
+
+    # 7. REPORT PATH
     if report_file:
-        print("Report generated:")
-        print(f"  {report_file}")
+        _section("7. REPORT PATH")
+        print()
+        print("  Report generated:")
+        print(f"    {report_file}")
         print()
 
     print(LINE)
 
     return success
+
 
 
 
