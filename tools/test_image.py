@@ -15,9 +15,11 @@ It only displays the safe_text and entity metadata returned by the backend.
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import pathlib
 from typing import Any
+
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -140,11 +142,17 @@ def call_backend(image_path: pathlib.Path) -> dict[str, Any]:
         SystemExit(1) for connection errors or non-recoverable HTTP errors,
         printing a clean error report instead of a traceback.
     """
+    debug_mode = os.getenv("DEBUG_PII_REPORT", "false").lower() in ("true", "1", "t", "yes")
+    headers = {}
+    if debug_mode:
+        headers["X-Debug-PII-Report"] = "true"
+
     try:
         with image_path.open("rb") as fh:
             response = requests.post(
                 BACKEND_URL,
                 files={"image": (image_path.name, fh, "image/png")},
+                headers=headers,
                 timeout=TIMEOUT_SECONDS,
             )
     except (ReqConnectionError, OSError):
@@ -218,74 +226,38 @@ def call_backend(image_path: pathlib.Path) -> dict[str, Any]:
 
 def render_report(image_path: pathlib.Path, data: dict[str, Any]) -> bool:
     """
-    Print the full human-readable report.
+    Print the full human-readable report and return success status.
 
     Returns True if the response represents a successful result, False otherwise.
     """
     success: bool = bool(data.get("success", False))
-    safe_text: str = data.get("safe_text", "")
     entities: list[dict] = data.get("entities_found", [])
-
-    file_size = image_path.stat().st_size
-    file_type = _guess_type(image_path)
+    report_file: str | None = data.get("report_file")
 
     # ── Header ────────────────────────────────────────────────────────────────
-    _header("         REDACTION IMAGE TEST")
+    _header("REDACTION IMAGE TEST")
 
     print()
     print("Image:")
-    print(f"  {image_path}")
+    print(f"  {image_path.name}")
     print()
-    print("File:")
-    print(f"  Name: {image_path.name}")
-    print(f"  Size: {_fmt_size(file_size)}")
-    print(f"  Type: {file_type}")
+    print(f"OCR: {'PASS' if success else 'FAIL'}")
+    print(f"PII Detection: {'PASS' if success else 'FAIL'}")
+    print(f"Anonymization: {'PASS' if success else 'FAIL'}")
+    print()
+    print(f"Detected entities: {len(entities)}")
+    print()
 
-    # ── Safe text ─────────────────────────────────────────────────────────────
-    _section("OCR / SAFE TEXT RESULT")
-    print()
-    if safe_text and safe_text.strip():
-        for line in safe_text.splitlines():
-            print(f"  {line}")
-    else:
-        print("  (no text extracted)")
-
-    # ── Entities ──────────────────────────────────────────────────────────────
-    _section("DETECTED PII ENTITIES")
-    print()
-    if entities:
-        print(f"  Total entities detected: {len(entities)}")
+    # ── Report file ───────────────────────────────────────────────────────────
+    if report_file:
+        print("Report generated:")
+        print(f"  {report_file}")
         print()
-        for i, entity in enumerate(entities, start=1):
-            entity_type = entity.get("type", "UNKNOWN")
-            score = entity.get("score", 0.0)
-            print(f"  {i}. {entity_type}")
-            print(f"     Confidence: {score:.2f}")
-    else:
-        print("  No PII entities detected.")
 
-    # ── Privacy check ─────────────────────────────────────────────────────────
-    _section("PRIVACY CHECK")
-    print()
-    if success:
-        _ok("Processing successful")
-        _ok("Safe text generated")
-        _ok("PII detection completed")
-    else:
-        error_msg = data.get("error", "Unknown error")
-        _fail(f"Processing failed: {error_msg}")
-
-    # ── Final result ──────────────────────────────────────────────────────────
-    _section("FINAL RESULT")
-    print()
-    if success:
-        print("PASS \u2713")
-    else:
-        print("FAIL \u2717")
-    print()
     print(LINE)
 
     return success
+
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────

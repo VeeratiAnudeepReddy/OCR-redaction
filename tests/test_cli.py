@@ -213,7 +213,6 @@ class TestRenderReport:
         out = capsys.readouterr().out
         assert result is True
         assert "PASS" in out
-        assert "\u2713" in out  # ✓
 
     def test_success_false_prints_fail(self, tmp_png, capsys):
         data = {"success": False, "error": "something went wrong"}
@@ -221,7 +220,6 @@ class TestRenderReport:
         out = capsys.readouterr().out
         assert result is False
         assert "FAIL" in out
-        assert "\u2717" in out  # ✗
 
     def test_no_pii_entities_message(self, tmp_png, capsys):
         data = {
@@ -231,9 +229,9 @@ class TestRenderReport:
         }
         render_report(tmp_png, data)
         out = capsys.readouterr().out
-        assert "No PII entities detected" in out
+        assert "Detected entities: 0" in out
 
-    def test_multiple_entities_numbered(self, tmp_png, capsys):
+    def test_multiple_entities_count(self, tmp_png, capsys):
         data = {
             "success": True,
             "safe_text": "Name: [PERSON]\nEmail: [EMAIL_ADDRESS]\nPhone: [PHONE_NUMBER]",
@@ -245,20 +243,7 @@ class TestRenderReport:
         }
         render_report(tmp_png, data)
         out = capsys.readouterr().out
-        assert "1. PERSON" in out
-        assert "2. EMAIL_ADDRESS" in out
-        assert "3. PHONE_NUMBER" in out
-        assert "Total entities detected: 3" in out
-
-    def test_safe_text_is_printed(self, tmp_png, capsys):
-        data = {
-            "success": True,
-            "safe_text": "Application ID: APP-2026-001",
-            "entities_found": [],
-        }
-        render_report(tmp_png, data)
-        out = capsys.readouterr().out
-        assert "APP-2026-001" in out
+        assert "Detected entities: 3" in out
 
     def test_raw_pii_not_injected(self, tmp_png, capsys):
         """The report must NOT add PII fields that the backend doesn't return."""
@@ -278,21 +263,21 @@ class TestRenderReport:
         render_report(tmp_png, data)
         out = capsys.readouterr().out
         assert "test.png" in out
-        assert "PNG" in out
 
     def test_missing_safe_text_key(self, tmp_png, capsys):
         """If backend omits safe_text the report should still print cleanly."""
         data = {"success": True, "entities_found": []}
         render_report(tmp_png, data)
         out = capsys.readouterr().out
-        assert "PASS" in out or "no text" in out.lower()
+        assert "PASS" in out
 
     def test_missing_entities_key(self, tmp_png, capsys):
         """If entities_found is absent the report should still print cleanly."""
         data = {"success": True, "safe_text": "Some text."}
         render_report(tmp_png, data)
         out = capsys.readouterr().out
-        assert "No PII entities detected" in out
+        assert "Detected entities: 0" in out
+
 
 
 # ── main() integration ────────────────────────────────────────────────────────

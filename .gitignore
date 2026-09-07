@@ -38,6 +38,13 @@ logs/
 uploads/
 temp/
 
+# Generated privacy reports (contain sanitized OCR output — not for git)
+output/
+
+# Redacted image output from /redact-image
+redacted_output.png
+
+
 # spaCy models (too large for git)
 # They are downloaded via: python -m spacy download en_core_web_lg
 

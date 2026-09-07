@@ -31,6 +31,9 @@ def create_test_image(output_path: str | pathlib.Path) -> None:
 
         Application ID: APP-2026-001
         Date: 2026-09-06
+
+        Username: testuser123
+        Handle: @sample_handle
     """)
 
     # Image dimensions chosen for clarity

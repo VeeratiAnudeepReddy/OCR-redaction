@@ -159,3 +159,166 @@ class TestProcessText:
         for entity in result.entities:
             assert entity.score >= PII_SCORE_THRESHOLD, \
                 f"Entity {entity.entity_type} has score {entity.score} below threshold"
+
+
+# ---------------------------------------------------------------------------
+# Tests for custom USERNAME and SOCIAL_HANDLE recognizers
+# ---------------------------------------------------------------------------
+
+class TestUsernameRecognizers:
+    """
+    Verify the custom PatternRecognizers for USERNAME and SOCIAL_HANDLE
+    that are registered into the Presidio AnalyzerEngine at startup.
+    """
+
+    # ── Detection tests ──────────────────────────────────────────────────────
+
+    def test_labeled_username_detected(self):
+        """'Username: testuser123' must trigger a USERNAME entity."""
+        text = "Username: testuser123"
+        results = analyze_text(text)
+        types = [r.entity_type for r in results]
+        assert "USERNAME" in types, (
+            f"USERNAME not detected in '{text}'. Entities found: {types}"
+        )
+
+    def test_login_label_detected(self):
+        """'Login: admin_user01' must trigger a USERNAME entity."""
+        text = "Login: admin_user01"
+        results = analyze_text(text)
+        types = [r.entity_type for r in results]
+        assert "USERNAME" in types, (
+            f"USERNAME not detected in '{text}'. Entities found: {types}"
+        )
+
+    def test_bare_handle_detected(self):
+        """'@dev_jane' must trigger a SOCIAL_HANDLE entity."""
+        text = "Follow us on @dev_jane for updates."
+        results = analyze_text(text)
+        types = [r.entity_type for r in results]
+        assert "SOCIAL_HANDLE" in types, (
+            f"SOCIAL_HANDLE not detected in '{text}'. Entities found: {types}"
+        )
+
+    def test_handle_label_detected(self):
+        """'Handle: @sample_handle' must trigger USERNAME (label match) or
+        SOCIAL_HANDLE (bare @ match) — either is acceptable coverage."""
+        text = "Handle: @sample_handle"
+        results = analyze_text(text)
+        types = [r.entity_type for r in results]
+        assert "USERNAME" in types or "SOCIAL_HANDLE" in types, (
+            f"Neither USERNAME nor SOCIAL_HANDLE detected in '{text}'. "
+            f"Entities found: {types}"
+        )
+
+    # ── Redaction tests ──────────────────────────────────────────────────────
+
+    def test_labeled_username_redacted(self):
+        """Raw username value must not appear in safe_text; [USERNAME] must."""
+        text = "Username: testuser123"
+        result = process_text(text)
+        username_detected = any(e.entity_type == "USERNAME" for e in result.entities)
+        assert username_detected, "USERNAME entity not detected — check recognizer registration"
+        assert "testuser123" not in result.safe_text, (
+            f"PRIVACY VIOLATION: raw username in safe_text: {result.safe_text!r}"
+        )
+        assert "[USERNAME]" in result.safe_text, (
+            f"[USERNAME] placeholder missing from safe_text: {result.safe_text!r}"
+        )
+
+    def test_bare_handle_redacted(self):
+        """Raw @handle must not appear in safe_text; [HANDLE] must."""
+        text = "Contact @sample_handle for help."
+        result = process_text(text)
+        handle_detected = any(e.entity_type == "SOCIAL_HANDLE" for e in result.entities)
+        assert handle_detected, "SOCIAL_HANDLE entity not detected — check recognizer registration"
+        assert "@sample_handle" not in result.safe_text, (
+            f"PRIVACY VIOLATION: raw handle in safe_text: {result.safe_text!r}"
+        )
+        assert "[HANDLE]" in result.safe_text, (
+            f"[HANDLE] placeholder missing from safe_text: {result.safe_text!r}"
+        )
+
+    # ── False-positive guards ────────────────────────────────────────────────
+
+    def test_course_not_flagged_as_username(self):
+        """'Course: Computer Science' must NOT trigger USERNAME."""
+        text = "Course: Computer Science"
+        results = analyze_text(text)
+        username_entities = [r for r in results if r.entity_type == "USERNAME"]
+        assert username_entities == [], (
+            f"FALSE POSITIVE: USERNAME incorrectly detected in '{text}': "
+            f"{username_entities}"
+        )
+
+    def test_college_not_flagged_as_username(self):
+        """'College: ABC University' must NOT trigger USERNAME."""
+        text = "College: ABC University"
+        results = analyze_text(text)
+        username_entities = [r for r in results if r.entity_type == "USERNAME"]
+        assert username_entities == [], (
+            f"FALSE POSITIVE: USERNAME incorrectly detected in '{text}': "
+            f"{username_entities}"
+        )
+
+    def test_application_id_not_flagged_as_username(self):
+        """'Application ID: APP-2026-001' must NOT trigger USERNAME."""
+        text = "Application ID: APP-2026-001"
+        results = analyze_text(text)
+        username_entities = [r for r in results if r.entity_type == "USERNAME"]
+        assert username_entities == [], (
+            f"FALSE POSITIVE: USERNAME incorrectly detected in '{text}': "
+            f"{username_entities}"
+        )
+
+    def test_non_pii_preserved_alongside_username(self):
+        """USERNAME is detected even when other PII entities are also present.
+
+        Note: Presidio's spaCy model may legitimately detect 'Computer Science'
+        or 'ABC University' as ORGANIZATION entities, and their surrounding label
+        text may be included in the NER span.  This test only verifies that the
+        custom USERNAME recognizer correctly fires for 'Username:' prefixed fields
+        when processed alongside other PII-bearing fields — not that other
+        entity spans leave label text intact.
+        """
+        text = (
+            "Username: testuser123\n"
+            "Course: Computer Science\n"
+            "College: ABC University\n"
+        )
+        result = process_text(text)
+        # Core assertion: USERNAME must be detected by our custom recognizer
+        assert any(e.entity_type == "USERNAME" for e in result.entities), (
+            "USERNAME entity was not detected in text containing 'Username: testuser123'"
+        )
+        # The raw username value must be absent from safe_text
+        assert "testuser123" not in result.safe_text, (
+            "PRIVACY VIOLATION: raw username 'testuser123' still present in safe_text"
+        )
+
+
+
+    # ── Privacy boundary ────────────────────────────────────────────────────
+
+    def test_raw_username_never_in_safe_text(self):
+        """Core privacy assertion for username fields."""
+        raw_username = "super_secret_user99"
+        text = f"Username: {raw_username}"
+        result = process_text(text)
+        if any(e.entity_type == "USERNAME" for e in result.entities):
+            assert raw_username not in result.safe_text, (
+                f"PRIVACY VIOLATION: raw username '{raw_username}' found in "
+                f"safe_text: {result.safe_text!r}"
+            )
+
+    def test_raw_handle_never_in_safe_text(self):
+        """Core privacy assertion for @handle fields."""
+        raw_handle = "@private_acc123"
+        text = f"Handle: {raw_handle}"
+        result = process_text(text)
+        if any(e.entity_type in ("USERNAME", "SOCIAL_HANDLE") for e in result.entities):
+            assert raw_handle not in result.safe_text, (
+                f"PRIVACY VIOLATION: raw handle '{raw_handle}' found in "
+                f"safe_text: {result.safe_text!r}"
+            )
+

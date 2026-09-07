@@ -33,6 +33,7 @@ from flask_cors import CORS
 
 import backend.config as config
 from backend.processor import ImageValidationError, process_image_bytes
+from backend.report import write_report
 
 # ---------------------------------------------------------------------------
 # Logging configuration
@@ -135,11 +136,16 @@ def process_image() -> tuple[Response, int]:
         return jsonify({"success": False, "error": "Uploaded image is empty."}), 400
 
     # ── Pipeline ─────────────────────────────────────────────────────────────
+    debug_report_env = os.getenv("DEBUG_PII_REPORT", "false").lower() in ("true", "1", "t", "yes")
+    debug_report_hdr = request.headers.get("X-Debug-PII-Report", "").lower() in ("true", "1", "t", "yes")
+    debug_pii_report = debug_report_env or debug_report_hdr or config.DEBUG_PII_REPORT
+
     try:
         result = process_image_bytes(
             data=image_bytes,
             filename=file.filename,
             preprocess=True,
+            debug_pii_report=debug_pii_report,
         )
     except ImageValidationError as exc:
         return jsonify({"success": False, "error": str(exc)}), exc.http_status
@@ -151,6 +157,18 @@ def process_image() -> tuple[Response, int]:
         logger.error("Unhandled exception during /process-image (details suppressed).")
         return jsonify({"success": False, "error": "Unexpected server error."}), 500
 
+    # ── Write privacy report ──────────────────────────────────────────
+    report_file: str | None = None
+    try:
+        report_file = write_report(
+            image_filename=file.filename,
+            result=result,
+            debug_pii_report=debug_pii_report,
+        )
+    except Exception:  # noqa: BLE001
+        # Report failure is non-fatal — pipeline result is still returned.
+        logger.error("Failed to write privacy report (details suppressed).")
+
     # ── Response — NEVER include raw OCR or PII values ──────────────────────
     entities_payload = [
         {
@@ -160,13 +178,16 @@ def process_image() -> tuple[Response, int]:
         for e in result.entities
     ]
 
-    return jsonify(
-        {
-            "success": True,
-            "safe_text": result.safe_text,
-            "entities_found": entities_payload,
-        }
-    ), 200
+    response_body: dict = {
+        "success": True,
+        "safe_text": result.safe_text,
+        "entities_found": entities_payload,
+    }
+    if report_file is not None:
+        response_body["report_file"] = report_file
+
+    return jsonify(response_body), 200
+
 
 
 @app.route("/redact-image", methods=["POST"])

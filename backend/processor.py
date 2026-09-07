@@ -98,6 +98,7 @@ def process_image_bytes(
     data: bytes,
     filename: str = "",
     preprocess: bool = True,
+    debug_pii_report: Optional[bool] = None,
 ) -> AnalysisResult:
     """
     Full privacy pipeline: raw image bytes → sanitised AnalysisResult.
@@ -113,6 +114,7 @@ def process_image_bytes(
         data: Raw bytes of the uploaded image (PNG / JPEG / WEBP).
         filename: Original filename for extension validation (optional).
         preprocess: Whether to run image preprocessing before OCR.
+        debug_pii_report: Whether debug report mode is enabled.
 
     Returns:
         :class:`~backend.pii.AnalysisResult` — sanitised text + entity list.
@@ -142,7 +144,7 @@ def process_image_bytes(
     raw_text: str = extract_text_from_image(image, preprocess=preprocess)
 
     # Step 4 — Presidio pipeline
-    result: AnalysisResult = process_text(raw_text)
+    result: AnalysisResult = process_text(raw_text, debug_pii_report=debug_pii_report)
 
     # raw_text goes out of scope here — not stored, not returned, not logged.
     logger.info(
@@ -156,6 +158,7 @@ def process_image_bytes(
 def process_image_object(
     image: Image.Image,
     preprocess: bool = True,
+    debug_pii_report: Optional[bool] = None,
 ) -> AnalysisResult:
     """
     Convenience overload: accept a PIL Image directly instead of raw bytes.
@@ -170,10 +173,11 @@ def process_image_object(
     )
 
     raw_text: str = extract_text_from_image(image, preprocess=preprocess)
-    result: AnalysisResult = process_text(raw_text)
+    result: AnalysisResult = process_text(raw_text, debug_pii_report=debug_pii_report)
 
     logger.info(
         "Pipeline complete. Entities found: %d.",
         len(result.entities),
     )
     return result
+
