@@ -20,6 +20,14 @@ import sys
 import pathlib
 from typing import Any
 
+# Ensure project root is in sys.path
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+
+try:
+    import backend.config as config
+except ImportError:
+    config = None
+
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -222,9 +230,6 @@ def call_backend(image_path: pathlib.Path) -> dict[str, Any]:
     return data
 
 
-import backend.config as config
-
-
 # ── Report renderer ───────────────────────────────────────────────────────────
 
 def render_report(image_path: pathlib.Path, data: dict[str, Any]) -> bool:
@@ -295,7 +300,11 @@ def render_report(image_path: pathlib.Path, data: dict[str, Any]) -> bool:
                 val, token = entity_val_map[i - 1]
             else:
                 val = "[HIDDEN]"
-                token = config.ANONYMIZATION_LABELS.get(entity_type, f"[{entity_type}]")
+                token = (
+                    config.ANONYMIZATION_LABELS.get(entity_type, f"[{entity_type}]")
+                    if config and hasattr(config, "ANONYMIZATION_LABELS")
+                    else f"[{entity_type}]"
+                )
             print(f"  {i}. Type:        {entity_type}")
             print(f"     Value:       {val}")
             print(f"     Confidence:  {score:.2f}")
