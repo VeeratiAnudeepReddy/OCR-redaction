@@ -88,3 +88,23 @@ SPACY_MODEL: str = os.getenv("SPACY_MODEL", "en_core_web_lg")
 # Override with OUTPUT_DIR env var, e.g.:  OUTPUT_DIR=/tmp/reports python backend/app.py
 REPORT_OUTPUT_DIR: str = os.getenv("OUTPUT_DIR", "output")
 
+# ── Face detection ───────────────────────────────────────────────────────────
+# Confidence threshold: detections with score < this are discarded.
+# Default 0.5 biases toward recall over precision (prioritises not missing faces).
+FACE_DETECTION_CONFIDENCE: float = float(os.getenv("FACE_DETECTION_CONFIDENCE", "0.5"))
+
+# Generous percentage padding applied to each detected face bounding box
+# to capture hair, forehead, ears, and chin margins (default 20%).
+FACE_PADDING_RATIO: float = float(os.getenv("FACE_PADDING_RATIO", "0.20"))
+
+# Base Gaussian blur radius for faces — strong enough to obliterate facial details
+FACE_BLUR_RADIUS: int = int(os.getenv("FACE_BLUR_RADIUS", "30"))
+
+# Path to OpenCV SSD Caffe model files
+FACE_MODEL_DIR: str = os.getenv(
+    "FACE_MODEL_DIR",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "models"),
+)
+FACE_PROTO_PATH: str = os.path.join(FACE_MODEL_DIR, "deploy.prototxt")
+FACE_MODEL_PATH: str = os.path.join(FACE_MODEL_DIR, "res10_300x300_ssd_iter_140000.caffemodel")
+

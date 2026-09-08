@@ -20,6 +20,7 @@ from PIL import Image, ImageDraw, ImageFilter
 
 from backend.ocr import OCRResult, OCRWord
 from backend.pii import DetectedEntity
+from backend.face import FaceRegion
 
 logger = logging.getLogger(__name__)
 
@@ -124,48 +125,29 @@ def _pad_box(box: PixelBox, padding: int, img_width: int, img_height: int) -> Pi
     )
 
 
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
-
-def apply_blur_redaction(
-    image: Image.Image,
+def _collect_redaction_boxes(
     entities: Sequence[DetectedEntity],
     ocr_result: OCRResult,
-    blur_radius: int = BLUR_RADIUS,
-    padding: int = REDACTION_PADDING_PX,
-) -> Tuple[Image.Image, int, int]:
+    img_w: int,
+    img_h: int,
+    padding: int,
+    face_regions: Optional[Sequence[FaceRegion]] = None,
+) -> Tuple[List[PixelBox], int]:
     """
-    Apply Gaussian blur over detected PII regions.
-
-    For each entity that maps to one or more pixel bounding boxes, the
-    corresponding region is cropped, blurred, and pasted back in-place.
-    Regions without mappable bounding boxes are skipped with a WARNING log.
-
-    Args:
-        image:       Original PIL Image (any mode).
-        entities:    PII entities with text offsets.
-        ocr_result:  OCR result containing text and word-level bounding boxes.
-        blur_radius: Gaussian blur radius (higher = stronger blur).
-        padding:     Extra pixels added around each box before blurring.
+    Combine both sets of regions (text-PII regions + face regions) into one
+    unified list of PixelBox bounding boxes to redact.
 
     Returns:
-        Tuple of (redacted_image, blurred_region_count, skipped_entity_count).
-        Pixel values outside PII regions are pixel-for-pixel identical to the
-        original image (no compression artefacts because we never re-encode here).
+        Tuple of (boxes_to_redact, skipped_text_entity_count).
     """
-    # Work on a copy so the original is untouched
-    redacted = image.copy().convert("RGB")
-    img_w, img_h = redacted.size
     text = ocr_result.text
     words = ocr_result.words
-
-    blurred_count = 0
+    boxes_to_redact: List[PixelBox] = []
     skipped_count = 0
 
+    # 1. Text PII regions
     for entity in entities:
         boxes = _text_span_to_pixel_boxes(text, entity.start, entity.end, words)
-
         if not boxes:
             logger.warning(
                 "No pixel bounding box found for entity type=%s — visual redaction skipped for this entity.",
@@ -176,19 +158,86 @@ def apply_blur_redaction(
 
         for box in boxes:
             padded = _pad_box(box, padding, img_w, img_h)
+            if padded.left < padded.right and padded.top < padded.bottom:
+                boxes_to_redact.append(padded)
 
-            # Skip degenerate (zero-area) boxes
-            if padded.left >= padded.right or padded.top >= padded.bottom:
-                continue
+    # 2. Face regions
+    if face_regions:
+        for face in face_regions:
+            fb = PixelBox(
+                left=max(0, face.left),
+                top=max(0, face.top),
+                right=min(img_w, face.right),
+                bottom=min(img_h, face.bottom),
+            )
+            if fb.left < fb.right and fb.top < fb.bottom:
+                boxes_to_redact.append(fb)
 
-            region = redacted.crop((padded.left, padded.top, padded.right, padded.bottom))
-            blurred_region = region.filter(ImageFilter.GaussianBlur(radius=blur_radius))
-            redacted.paste(blurred_region, (padded.left, padded.top))
-            blurred_count += 1
+    return boxes_to_redact, skipped_count
 
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+def apply_blur_redaction(
+    image: Image.Image,
+    entities: Sequence[DetectedEntity],
+    ocr_result: OCRResult,
+    blur_radius: int = BLUR_RADIUS,
+    padding: int = REDACTION_PADDING_PX,
+    face_regions: Optional[Sequence[FaceRegion]] = None,
+) -> Tuple[Image.Image, int, int]:
+    """
+    Apply Gaussian blur over detected PII regions (both text and faces).
+
+    For each region that maps to a pixel bounding box, the corresponding
+    region is cropped, blurred, and pasted back in-place using the exact same
+    blur function.
+
+    Args:
+        image:        Original PIL Image (any mode).
+        entities:     PII entities with text offsets.
+        ocr_result:   OCR result containing text and word-level bounding boxes.
+        blur_radius:  Gaussian blur radius (higher = stronger blur).
+        padding:      Extra pixels added around each text box before blurring.
+        face_regions: Optional detected face regions to redact alongside text.
+
+    Returns:
+        Tuple of (redacted_image, blurred_region_count, skipped_entity_count).
+        Pixel values outside PII regions are pixel-for-pixel identical to the
+        original image.
+    """
+    # Work on a copy so the original is untouched
+    redacted = image.copy().convert("RGB")
+    img_w, img_h = redacted.size
+
+    boxes, skipped_count = _collect_redaction_boxes(
+        entities=entities,
+        ocr_result=ocr_result,
+        img_w=img_w,
+        img_h=img_h,
+        padding=padding,
+        face_regions=face_regions,
+    )
+
+    blurred_count = 0
+    for box in boxes:
+        region = redacted.crop((box.left, box.top, box.right, box.bottom))
+        # Adaptive radius ensures large areas (such as human faces) are thoroughly
+        # blurred so no facial details (eyes, nose, mouth) remain discernible,
+        # while preserving configured blur_radius for small text regions.
+        box_min_dim = min(box.right - box.left, box.bottom - box.top)
+        effective_radius = max(blur_radius, int(box_min_dim * 0.20))
+        blurred_region = region.filter(ImageFilter.GaussianBlur(radius=effective_radius))
+        redacted.paste(blurred_region, (box.left, box.top))
+        blurred_count += 1
+
+    face_count = len(face_regions) if face_regions else 0
     logger.info(
-        "Blur redaction complete: method=blur | entities=%d | blurred_boxes=%d | skipped=%d.",
+        "Blur redaction complete: method=blur | entities=%d | faces=%d | blurred_boxes=%d | skipped=%d.",
         len(entities),
+        face_count,
         blurred_count,
         skipped_count,
     )
@@ -201,50 +250,40 @@ def apply_blackbox_redaction(
     ocr_result: OCRResult,
     fill: Tuple[int, int, int] = BLACKBOX_FILL,
     padding: int = REDACTION_PADDING_PX,
+    face_regions: Optional[Sequence[FaceRegion]] = None,
 ) -> Tuple[Image.Image, int, int]:
     """
-    Apply solid black-box redaction over detected PII regions.
-
-    Functionally equivalent to the old ImageRedactorEngine.redact() path
-    but uses our own OCR word map so bounding boxes are consistent with
-    the entities we detected.
+    Apply solid black-box redaction over detected PII regions (both text and faces).
 
     Returns:
         Tuple of (redacted_image, drawn_box_count, skipped_entity_count).
     """
     redacted = image.copy().convert("RGB")
     img_w, img_h = redacted.size
-    text = ocr_result.text
-    words = ocr_result.words
     draw = ImageDraw.Draw(redacted)
 
+    boxes, skipped_count = _collect_redaction_boxes(
+        entities=entities,
+        ocr_result=ocr_result,
+        img_w=img_w,
+        img_h=img_h,
+        padding=padding,
+        face_regions=face_regions,
+    )
+
     drawn_count = 0
-    skipped_count = 0
+    for box in boxes:
+        draw.rectangle(
+            [box.left, box.top, box.right, box.bottom],
+            fill=fill,
+        )
+        drawn_count += 1
 
-    for entity in entities:
-        boxes = _text_span_to_pixel_boxes(text, entity.start, entity.end, words)
-
-        if not boxes:
-            logger.warning(
-                "No pixel bounding box found for entity type=%s — visual redaction skipped.",
-                entity.entity_type,
-            )
-            skipped_count += 1
-            continue
-
-        for box in boxes:
-            padded = _pad_box(box, padding, img_w, img_h)
-            if padded.left >= padded.right or padded.top >= padded.bottom:
-                continue
-            draw.rectangle(
-                [padded.left, padded.top, padded.right, padded.bottom],
-                fill=fill,
-            )
-            drawn_count += 1
-
+    face_count = len(face_regions) if face_regions else 0
     logger.info(
-        "Blackbox redaction complete: method=blackbox | entities=%d | drawn_boxes=%d | skipped=%d.",
+        "Blackbox redaction complete: method=blackbox | entities=%d | faces=%d | drawn_boxes=%d | skipped=%d.",
         len(entities),
+        face_count,
         drawn_count,
         skipped_count,
     )
@@ -256,15 +295,17 @@ def redact_image(
     entities: Sequence[DetectedEntity],
     ocr_result: OCRResult,
     method: str = DEFAULT_METHOD,
+    face_regions: Optional[Sequence[FaceRegion]] = None,
 ) -> Image.Image:
     """
-    Public entry point: redact detected PII regions in *image*.
+    Public entry point: redact detected PII regions (text and faces) in *image*.
 
     Args:
-        image:      Original PIL Image.
-        entities:   PII entities from :func:`backend.pii.process_text`.
-        ocr_result: OCR result from :func:`backend.ocr.extract_ocr_result`.
-        method:     ``"blur"`` (default) or ``"blackbox"``.
+        image:        Original PIL Image.
+        entities:     PII entities from :func:`backend.pii.process_text`.
+        ocr_result:   OCR result from :func:`backend.ocr.extract_ocr_result`.
+        method:       ``"blur"`` (default) or ``"blackbox"``.
+        face_regions: Optional detected face regions to redact.
 
     Returns:
         Redacted PIL Image in RGB mode, same dimensions as input.
@@ -278,8 +319,12 @@ def redact_image(
         )
 
     if method == "blur":
-        result_image, _, _ = apply_blur_redaction(image, entities, ocr_result)
+        result_image, _, _ = apply_blur_redaction(
+            image, entities, ocr_result, face_regions=face_regions
+        )
     else:  # "blackbox"
-        result_image, _, _ = apply_blackbox_redaction(image, entities, ocr_result)
+        result_image, _, _ = apply_blackbox_redaction(
+            image, entities, ocr_result, face_regions=face_regions
+        )
 
     return result_image

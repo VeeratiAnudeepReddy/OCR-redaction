@@ -250,12 +250,17 @@ def redact_image() -> tuple[Response, int]:
         # Run PII detection on the OCR text
         pii_result = process_text(text=ocr_result.text, ocr_words=ocr_result.words)
 
-        # Apply visual redaction using the requested method
+        # Run Face Detection on the input image
+        from backend.face import detect_faces
+        face_regions = detect_faces(pil_image)
+
+        # Apply visual redaction using the requested method (unifying text + face regions)
         redacted = _redact_image(
             image=pil_image,
             entities=pii_result.entities,
             ocr_result=ocr_result,
             method=method,
+            face_regions=face_regions,
         )
 
         # Serialise to PNG in memory — same dimensions, same format
@@ -264,11 +269,14 @@ def redact_image() -> tuple[Response, int]:
         buf.seek(0)
 
         logger.info(
-            "Image redaction completed. method=%s entities=%d.",
+            "Image redaction completed. method=%s entities=%d faces=%d.",
             method,
             len(pii_result.entities),
+            len(face_regions),
         )
-        return Response(buf.read(), status=200, mimetype="image/png")
+        response = Response(buf.read(), status=200, mimetype="image/png")
+        response.headers["X-Faces-Detected"] = str(len(face_regions))
+        return response
 
     except ImageValidationError as exc:
         return jsonify({"success": False, "error": str(exc)}), exc.http_status
