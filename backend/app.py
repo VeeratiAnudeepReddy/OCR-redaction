@@ -193,12 +193,19 @@ def process_image() -> tuple[Response, int]:
 @app.route("/redact-image", methods=["POST"])
 def redact_image() -> tuple[Response, int]:
     """
-    Optional visual redaction endpoint: image → redacted image (PNG).
+    Visual redaction endpoint: image → redacted image (PNG).
 
-    Returns the original image with PII regions blacked out.
+    Returns the original image with PII regions visually redacted.
 
     Accepts:
         multipart/form-data with field ``image``.
+
+    Query Parameters:
+        method: ``"blur"`` (default) or ``"blackbox"``.
+            - ``blur``     — Gaussian blur applied over PII regions; rest of
+                             image is pixel-for-pixel unchanged.
+            - ``blackbox`` — Solid black rectangle drawn over PII regions
+                             (legacy behaviour, preserved as fallback).
 
     Returns:
         200: PNG image with redacted regions (Content-Type: image/png)
@@ -215,42 +222,61 @@ def redact_image() -> tuple[Response, int]:
     if not image_bytes:
         return jsonify({"success": False, "error": "Uploaded image is empty."}), 400
 
-    try:
-        from presidio_image_redactor import ImageRedactorEngine
-        from PIL import Image as PILImage
+    # ── Resolve redaction method from query param or form field ───────────────
+    from backend.redaction import VALID_METHODS, DEFAULT_METHOD, redact_image as _redact_image
 
-        # Validate first via our standard pipeline
+    method = (
+        request.args.get("method")
+        or request.form.get("method")
+        or DEFAULT_METHOD
+    ).strip().lower()
+
+    if method not in VALID_METHODS:
+        return jsonify({
+            "success": False,
+            "error": f"Unknown redaction method {method!r}. Valid options: {sorted(VALID_METHODS)}",
+        }), 400
+
+    try:
         from backend.processor import _validate_image_bytes, _decode_image
+        from backend.ocr import extract_ocr_result
+        from backend.pii import process_text
+
         _validate_image_bytes(image_bytes, file.filename)
         pil_image = _decode_image(image_bytes)
 
-        # Ensure RGB for redactor
-        if pil_image.mode != "RGB":
-            pil_image = pil_image.convert("RGB")
+        # Run OCR — get full text AND word-level bounding boxes
+        ocr_result = extract_ocr_result(pil_image, preprocess=True)
 
-        redactor = ImageRedactorEngine()
-        redacted_image = redactor.redact(pil_image, fill=0)  # black fill
+        # Run PII detection on the OCR text
+        pii_result = process_text(text=ocr_result.text, ocr_words=ocr_result.words)
 
-        # Serialise to PNG in memory
+        # Apply visual redaction using the requested method
+        redacted = _redact_image(
+            image=pil_image,
+            entities=pii_result.entities,
+            ocr_result=ocr_result,
+            method=method,
+        )
+
+        # Serialise to PNG in memory — same dimensions, same format
         buf = io.BytesIO()
-        redacted_image.save(buf, format="PNG")
+        redacted.save(buf, format="PNG")
         buf.seek(0)
 
-        logger.info("Image redaction completed successfully.")
+        logger.info(
+            "Image redaction completed. method=%s entities=%d.",
+            method,
+            len(pii_result.entities),
+        )
         return Response(buf.read(), status=200, mimetype="image/png")
 
     except ImageValidationError as exc:
         return jsonify({"success": False, "error": str(exc)}), exc.http_status
-    except ImportError:
-        return jsonify(
-            {
-                "success": False,
-                "error": "presidio-image-redactor is not installed or incompatible.",
-            }
-        ), 501
     except Exception:  # noqa: BLE001
         logger.error("Unhandled exception during /redact-image (details suppressed).")
         return jsonify({"success": False, "error": "Image redaction failed."}), 500
+
 
 
 # ---------------------------------------------------------------------------

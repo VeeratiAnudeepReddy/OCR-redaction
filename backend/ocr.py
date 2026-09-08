@@ -379,6 +379,33 @@ def extract_ocr_result(
 
     words = _extract_words(best_variant_img, lang=lang, config_str=best_cfg)
 
+    # ── Coordinate normalisation ──────────────────────────────────────────────
+    # _extract_words returns pixel coordinates in the space of best_variant_img,
+    # which may have been upscaled relative to the original *image*.  Divide all
+    # bounding-box values by the scale factor so callers (e.g. redaction.py)
+    # can work directly in the original image's coordinate space.
+    orig_w, orig_h = image.size
+    var_w, var_h = best_variant_img.size
+    if var_w != orig_w or var_h != orig_h:
+        scale_x = orig_w / var_w
+        scale_y = orig_h / var_h
+        words = [
+            OCRWord(
+                text=w.text,
+                left=round(w.left * scale_x),
+                top=round(w.top * scale_y),
+                width=max(1, round(w.width * scale_x)),
+                height=max(1, round(w.height * scale_y)),
+                line_num=w.line_num,
+                block_num=w.block_num,
+            )
+            for w in words
+        ]
+        logger.debug(
+            "Scaled OCR word coordinates from variant size %dx%d back to original %dx%d.",
+            var_w, var_h, orig_w, orig_h,
+        )
+
     logger.info(
         "OCR (multi-variant) completed. Winner: %s | quality=%.3f | chars=%d | words_found=%d.",
         best_label,
@@ -387,6 +414,7 @@ def extract_ocr_result(
         len(words),
     )
     return OCRResult(text=best_text, words=words)
+
 
 
 def extract_text_from_image(

@@ -231,14 +231,14 @@ class TestRedactImage:
         assert resp.status_code == 400
 
     def test_valid_image_returns_image_or_error(self, client):
-        """Either returns a PNG image (200) or explains why it failed."""
+        """Either returns a PNG image (200) or a server error (500), never 501 now."""
         resp = client.post(
             "/redact-image",
             data={"image": (io.BytesIO(_make_png_bytes()), "test.png")},
             content_type="multipart/form-data",
         )
-        # 200 with image content, or 501 if image-redactor unavailable
-        assert resp.status_code in (200, 501)
+        # Now uses our own OCR-based redaction pipeline — always 200 PNG on success
+        assert resp.status_code in (200, 500)
 
 
 # ── 404 / 405 ────────────────────────────────────────────────────────────────
