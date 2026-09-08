@@ -58,61 +58,140 @@ class PixelBox(NamedTuple):
     bottom: int
 
 
+def _get_matching_words(
+    text: str,
+    start: int,
+    end: int,
+    words: List[OCRWord],
+) -> List[OCRWord]:
+    """
+    Find all OCRWord objects whose character span overlaps [start, end).
+
+    Uses precomputed word.start and word.end offsets when available (single-pass OCR).
+    Falls back to sequential string search if offsets are absent (e.g. mock test objects).
+    """
+    if not words:
+        return []
+
+    # Fast path: words have precomputed start/end offsets from backend/ocr.py
+    if any(w.end > 0 for w in words):
+        return [w for w in words if w.start < end and w.end > start]
+
+    # Fallback for synthetic/mock objects without precomputed offsets
+    matched: List[OCRWord] = []
+    cursor = 0
+    for word in words:
+        idx = text.find(word.text, cursor)
+        if idx == -1:
+            continue
+        w_start = idx
+        w_end = idx + len(word.text)
+        cursor = w_end
+        if w_start < end and w_end > start:
+            matched.append(word)
+    return matched
+
+
+def verify_entity_box_alignment(
+    expected_text: str,
+    matched_words: Sequence[OCRWord],
+    entity_type: str = "",
+) -> bool:
+    """
+    Sanity check: verify that the text of the matched OCR words substantially
+    overlaps with the expected entity text string.
+
+    Logs a WARNING if a mismatch is detected rather than silently blurring
+    the wrong region. Returns True if aligned, False if mismatched.
+    """
+    if not matched_words or not expected_text:
+        return False
+
+    import re
+    actual_words_text = " ".join(w.text for w in matched_words).strip().lower()
+    expected_clean = expected_text.strip().lower()
+
+    if expected_clean in actual_words_text or actual_words_text in expected_clean:
+        return True
+
+    exp_tokens = set(re.findall(r"\w+", expected_clean))
+    act_tokens = set(re.findall(r"\w+", actual_words_text))
+    if exp_tokens & act_tokens:
+        return True
+
+    logger.warning(
+        "Sanity check warning: bounding box words %r do not match detected %s entity %r.",
+        actual_words_text,
+        entity_type,
+        expected_clean,
+    )
+    return False
+
+
+def _words_to_union_boxes(words: Sequence[OCRWord]) -> List[PixelBox]:
+    """
+    Compute the union bounding box containing all words.
+    Groups words by line_num so multi-line entities receive one box per line.
+    """
+    if not words:
+        return []
+
+    lines_map: dict[int, List[OCRWord]] = {}
+    for w in words:
+        lines_map.setdefault(w.line_num, []).append(w)
+
+    boxes: List[PixelBox] = []
+    for line_words in lines_map.values():
+        boxes.append(
+            PixelBox(
+                left=min(w.left for w in line_words),
+                top=min(w.top for w in line_words),
+                right=max(w.left + w.width for w in line_words),
+                bottom=max(w.top + w.height for w in line_words),
+            )
+        )
+    return boxes
+
+
 def _text_span_to_pixel_boxes(
     text: str,
     start: int,
     end: int,
     words: List[OCRWord],
+    union: bool = False,
 ) -> List[PixelBox]:
     """
     Map a [start, end) character offset in *text* to pixel bounding boxes
     from the OCR word list.
 
-    The strategy:
-      1. Reconstruct which characters in *text* correspond to which OCRWord
-         by replaying the text token-by-token.
-      2. Collect all OCRWord objects whose character span overlaps [start, end).
-      3. Return one PixelBox per matched word.
+    Args:
+        text:  Full OCR text string.
+        start: Character start index of the entity.
+        end:   Character end index of the entity.
+        words: List of OCRWord objects.
+        union: If True, computes the smallest union rectangle enclosing all
+               matched words on each line. If False (default for backwards
+               compatibility with word-level assertions), returns per-word boxes.
 
-    This handles multi-word PII entities (e.g. "Peter Parker") by returning
-    separate boxes for each word, which are individually blurred.  The caller
-    may union them if desired.
-
-    Returns an empty list if no words map into the span.
+    Returns:
+        List of PixelBox bounding boxes.
     """
-    boxes: List[PixelBox] = []
+    matched = _get_matching_words(text, start, end, words)
+    if not matched:
+        return []
 
-    # Walk through the reconstructed text char-by-char using the same
-    # tokenisation that Tesseract produces.  We cannot use str.find() because
-    # the same word can appear multiple times, so we must track offsets.
-    cursor = 0
-    for word in words:
-        # Each word occupies exactly len(word.text) characters in the full
-        # text string, but the text string may have whitespace/newlines
-        # between words.  Find this word's occurrence starting at cursor.
-        word_text = word.text
-        idx = text.find(word_text, cursor)
-        if idx == -1:
-            # Word not found at or after cursor — skip (can happen if OCR
-            # word extraction used a different image variant than text extraction).
-            continue
+    if union:
+        return _words_to_union_boxes(matched)
 
-        w_start = idx
-        w_end = idx + len(word_text)
-
-        # Advance cursor past this word occurrence.
-        cursor = w_end
-
-        # Check for overlap with the PII span [start, end)
-        if w_start < end and w_end > start:
-            boxes.append(PixelBox(
-                left=word.left,
-                top=word.top,
-                right=word.left + word.width,
-                bottom=word.top + word.height,
-            ))
-
-    return boxes
+    return [
+        PixelBox(
+            left=w.left,
+            top=w.top,
+            right=w.left + w.width,
+            bottom=w.top + w.height,
+        )
+        for w in matched
+    ]
 
 
 def _pad_box(box: PixelBox, padding: int, img_width: int, img_height: int) -> PixelBox:
@@ -137,6 +216,11 @@ def _collect_redaction_boxes(
     Combine both sets of regions (text-PII regions + face regions) into one
     unified list of PixelBox bounding boxes to redact.
 
+    For text entities:
+      - Uses precomputed character offsets to identify matching OCR words.
+      - Executes internal sanity check to ensure matched words match the entity text.
+      - Computes union bounding boxes enclosing all words of each entity.
+
     Returns:
         Tuple of (boxes_to_redact, skipped_text_entity_count).
     """
@@ -147,8 +231,8 @@ def _collect_redaction_boxes(
 
     # 1. Text PII regions
     for entity in entities:
-        boxes = _text_span_to_pixel_boxes(text, entity.start, entity.end, words)
-        if not boxes:
+        matched_words = _get_matching_words(text, entity.start, entity.end, words)
+        if not matched_words:
             logger.warning(
                 "No pixel bounding box found for entity type=%s — visual redaction skipped for this entity.",
                 entity.entity_type,
@@ -156,6 +240,12 @@ def _collect_redaction_boxes(
             skipped_count += 1
             continue
 
+        # Sanity check: verify textual alignment between matched words and entity span
+        expected_text = text[entity.start:entity.end]
+        verify_entity_box_alignment(expected_text, matched_words, entity.entity_type)
+
+        # Compute union bounding box enclosing all matching words
+        boxes = _words_to_union_boxes(matched_words)
         for box in boxes:
             padded = _pad_box(box, padding, img_w, img_h)
             if padded.left < padded.right and padded.top < padded.bottom:

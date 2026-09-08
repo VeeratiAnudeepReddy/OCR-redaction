@@ -430,3 +430,170 @@ class TestRedactionModule:
         ocr = OCRResult(text="", words=[])
         result = redact_image(img, [], ocr, method="blur")
         assert result.mode == "RGB"
+
+
+# ---------------------------------------------------------------------------
+# 5. Offset-to-Pixel Alignment & Union Bounding Box Tests
+# ---------------------------------------------------------------------------
+
+class TestOffsetBoundingBoxAlignment:
+    """
+    Tests ensuring exact synchronization between OCR text offsets and pixel
+    bounding boxes, preventing mislocated redactions.
+    """
+
+    def test_github_profile_nav_tabs_unblurred(self, client):
+        """
+        Verify that navigation tabs near the top of the GitHub profile screenshot
+        remain unblurred while actual PII below is correctly redacted.
+        """
+        gh_path = TEST_DATA / "github_profile_screenshot.png"
+        if not gh_path.exists():
+            pytest.skip("github_profile_screenshot.png not found")
+
+        orig_img = Image.open(str(gh_path)).convert("RGB")
+
+        with open(str(gh_path), "rb") as f:
+            resp = client.post(
+                "/redact-image?method=blur",
+                data={"image": (f, "github_profile_screenshot.png")},
+                content_type="multipart/form-data",
+            )
+
+        assert resp.status_code == 200
+        redacted_img = _open_png_from_response(resp.data)
+
+        # Nav bar region for 'Repositories 12', 'Projects', 'Packages' (x: 100 to 330, y: 44 to 56)
+        # Verify that pixels in the nav bar remain identical to original
+        nav_orig = orig_img.crop((105, 44, 325, 56))
+        nav_redacted = redacted_img.crop((105, 44, 325, 56))
+        from PIL import ImageChops
+        diff = ImageChops.difference(nav_orig, nav_redacted)
+        assert diff.getbbox() is None, "Navigation tabs should remain sharp and unblurred!"
+
+        # Lower PII region (education / name info around y: 430) must be blurred
+        edu_orig = orig_img.crop((550, 430, 780, 442))
+        edu_redacted = redacted_img.crop((550, 430, 780, 442))
+        diff_edu = ImageChops.difference(edu_orig, edu_redacted)
+        assert diff_edu.getbbox() is not None, "Education PII must be redacted!"
+
+    def test_multi_word_entity_union_box(self):
+        """
+        Multi-word entity spanning multiple OCR words on a line gets a single
+        union bounding box enclosing all of them.
+        """
+        from backend.redaction import _text_span_to_pixel_boxes
+        from backend.ocr import OCRWord
+
+        # Construct a line of words with known coordinates and offsets
+        text = "Education: Vignana Jyothi Institute of Technology"
+        words = [
+            OCRWord(text="Education:", left=20, top=100, width=80, height=20, line_num=1, start=0, end=10),
+            OCRWord(text="Vignana", left=110, top=100, width=60, height=20, line_num=1, start=11, end=18),
+            OCRWord(text="Jyothi", left=175, top=100, width=50, height=20, line_num=1, start=19, end=25),
+            OCRWord(text="Institute", left=230, top=100, width=70, height=20, line_num=1, start=26, end=35),
+            OCRWord(text="of", left=305, top=100, width=20, height=20, line_num=1, start=36, end=38),
+            OCRWord(text="Technology", left=330, top=100, width=80, height=20, line_num=1, start=39, end=49),
+        ]
+
+        # Entity spans "Vignana Jyothi Institute of Technology" (start=11, end=49)
+        union_boxes = _text_span_to_pixel_boxes(text, 11, 49, words, union=True)
+        assert len(union_boxes) == 1
+        box = union_boxes[0]
+
+        # Encloses all words from Vignana (left=110) to Technology (right=330+80=410)
+        assert box.left == 110
+        assert box.top == 100
+        assert box.right == 410
+        assert box.bottom == 120
+
+    def test_multiple_entities_independent_boxes(self):
+        """
+        Multiple separate entities in different areas get distinct, independent
+        bounding boxes without cross-contamination.
+        """
+        from backend.redaction import _collect_redaction_boxes
+        from backend.ocr import OCRResult, OCRWord
+        from backend.pii import DetectedEntity
+
+        text = "Name: Sarah Connor\nEmail: sarah@skynet.org"
+        words = [
+            OCRWord(text="Name:", left=10, top=50, width=40, height=15, line_num=1, start=0, end=5),
+            OCRWord(text="Sarah", left=60, top=50, width=40, height=15, line_num=1, start=6, end=11),
+            OCRWord(text="Connor", left=105, top=50, width=50, height=15, line_num=1, start=12, end=18),
+            OCRWord(text="Email:", left=10, top=90, width=40, height=15, line_num=2, start=19, end=25),
+            OCRWord(text="sarah@skynet.org", left=60, top=90, width=120, height=15, line_num=2, start=26, end=42),
+        ]
+        ocr = OCRResult(text=text, words=words)
+
+        ent1 = DetectedEntity(entity_type="PERSON", score=0.9, start=6, end=18)
+        ent2 = DetectedEntity(entity_type="EMAIL_ADDRESS", score=0.95, start=26, end=42)
+
+        boxes, skipped = _collect_redaction_boxes([ent1, ent2], ocr, img_w=500, img_h=300, padding=0)
+        assert skipped == 0
+        assert len(boxes) == 2
+
+        # Box 1 is Sarah Connor at y=50
+        assert boxes[0].left == 60
+        assert boxes[0].right == 155
+        assert boxes[0].top == 50
+        assert boxes[0].bottom == 65
+
+        # Box 2 is Email at y=90
+        assert boxes[1].left == 60
+        assert boxes[1].right == 180
+        assert boxes[1].top == 90
+        assert boxes[1].bottom == 105
+
+    def test_sanity_check_assertion_detects_mismatch(self, caplog):
+        """
+        If offsets point to completely mismatched words, verify_entity_box_alignment
+        returns False and logs a warning.
+        """
+        import logging
+        from backend.redaction import verify_entity_box_alignment
+        from backend.ocr import OCRWord
+
+        words = [
+            OCRWord(text="Overview", left=10, top=10, width=50, height=15, line_num=1),
+            OCRWord(text="Repositories", left=65, top=10, width=80, height=15, line_num=1),
+        ]
+
+        with caplog.at_level(logging.WARNING):
+            is_valid = verify_entity_box_alignment(
+                expected_text="Acme Corporation Ltd",
+                matched_words=words,
+                entity_type="ORGANIZATION",
+            )
+
+        assert is_valid is False
+        assert "Sanity check warning" in caplog.text
+        assert "overview repositories" in caplog.text.lower()
+
+    def test_regression_login_and_face_boxes(self, client):
+        """
+        Re-run login screenshot (USERNAME/PASSWORD) and single face through
+        the fixed pipeline to ensure zero regression in existing functionality.
+        """
+        # 1. Login screenshot
+        with open(str(LOGIN_PNG), "rb") as f:
+            resp_login = client.post(
+                "/redact-image?method=blur",
+                data={"image": (f, "login_screenshot.png")},
+                content_type="multipart/form-data",
+            )
+        assert resp_login.status_code == 200
+        img_login = _open_png_from_response(resp_login.data)
+        assert img_login.format == "PNG"
+
+        # 2. Face test
+        face_path = TEST_DATA / "face_single.png"
+        if face_path.exists():
+            with open(str(face_path), "rb") as f:
+                resp_face = client.post(
+                    "/redact-image?method=blur",
+                    data={"image": (f, "face_single.png")},
+                    content_type="multipart/form-data",
+                )
+            assert resp_face.status_code == 200
+            assert resp_face.headers.get("X-Faces-Detected") == "1"

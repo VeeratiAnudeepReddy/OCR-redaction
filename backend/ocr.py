@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class OCRWord:
-    """Bounding box and line location of an OCR word."""
+    """Bounding box and line location of an OCR word with character offsets."""
     text: str
     left: int
     top: int
@@ -39,6 +39,8 @@ class OCRWord:
     height: int
     line_num: int
     block_num: int = 0
+    start: int = 0
+    end: int = 0
 
 
 @dataclass
@@ -268,29 +270,77 @@ def _run_ocr(image: Image.Image, config_str: str, lang: str) -> Tuple[str, float
         return "", 0.0
 
 
-def _extract_words(image: Image.Image, lang: str, config_str: str) -> List[OCRWord]:
-    """Helper to extract OCRWord bounding boxes via image_to_data."""
+def _extract_words_and_text(
+    image: Image.Image,
+    lang: str,
+    config_str: str,
+) -> Tuple[str, List[OCRWord]]:
+    """
+    Extract OCRWord bounding boxes and construct the full text string in a single pass.
+
+    Builds the text by grouping words by (block_num, par_num, line_num), joining words
+    with a single space and lines with a newline. Every OCRWord is assigned its exact
+    character start and end offsets in that string, guaranteeing by construction that
+    text[word.start:word.end] == word.text.
+    """
     try:
-        data = pytesseract.image_to_data(image, lang=lang, config=config_str, output_type=pytesseract.Output.DICT)
+        data = pytesseract.image_to_data(
+            image, lang=lang, config=config_str, output_type=pytesseract.Output.DICT
+        )
         n = len(data.get("text", []))
-        words: List[OCRWord] = []
+        if n == 0:
+            return "", []
+
+        lines: dict[Tuple[int, int, int], List[OCRWord]] = {}
         for i in range(n):
             w_text = data["text"][i].strip()
-            if w_text:
-                words.append(
-                    OCRWord(
-                        text=w_text,
-                        left=data["left"][i],
-                        top=data["top"][i],
-                        width=data["width"][i],
-                        height=data["height"][i],
-                        line_num=data["line_num"][i],
-                        block_num=data.get("block_num", [0] * n)[i],
-                    )
-                )
-        return words
+            if not w_text:
+                continue
+            b = data.get("block_num", [0] * n)[i]
+            p = data.get("par_num", [0] * n)[i]
+            l = data["line_num"][i]
+            key = (b, p, l)
+            word = OCRWord(
+                text=w_text,
+                left=data["left"][i],
+                top=data["top"][i],
+                width=data["width"][i],
+                height=data["height"][i],
+                line_num=l,
+                block_num=b,
+            )
+            lines.setdefault(key, []).append(word)
+
+        if not lines:
+            return "", []
+
+        full_text_parts: List[str] = []
+        all_words: List[OCRWord] = []
+        curr_offset = 0
+
+        for key, line_words in lines.items():
+            for j, w in enumerate(line_words):
+                w.start = curr_offset
+                w.end = curr_offset + len(w.text)
+                all_words.append(w)
+                curr_offset = w.end
+                if j < len(line_words) - 1:
+                    curr_offset += 1  # space between words
+
+            line_str = " ".join(w.text for w in line_words)
+            full_text_parts.append(line_str)
+            curr_offset += 1  # newline after line
+
+        final_text = "\n".join(full_text_parts) + "\n" if full_text_parts else ""
+        return final_text, all_words
     except Exception:  # noqa: BLE001
-        return []
+        return "", []
+
+
+def _extract_words(image: Image.Image, lang: str, config_str: str) -> List[OCRWord]:
+    """Helper to extract OCRWord bounding boxes via image_to_data."""
+    _, words = _extract_words_and_text(image, lang=lang, config_str=config_str)
+    return words
 
 
 def extract_ocr_result(
@@ -303,14 +353,14 @@ def extract_ocr_result(
     Extract text and word-level bounding box data from a PIL Image.
 
     Returns:
-        :class:`OCRResult` containing full text string and structured word positions.
+        :class:`OCRResult` containing full text string and structured word positions
+        with exact character start and end offsets.
     """
     if not preprocess:
         try:
-            raw_text: str = pytesseract.image_to_string(
-                image, lang=lang, config=tesseract_config,
+            raw_text, words = _extract_words_and_text(
+                image, lang=lang, config_str=tesseract_config,
             )
-            words = _extract_words(image, lang=lang, config_str=tesseract_config)
             logger.info(
                 "OCR (single-pass) completed. Extracted %d characters (content not logged).",
                 len(raw_text.strip()),
@@ -330,8 +380,8 @@ def extract_ocr_result(
 
     # ── Multi-variant path ────────────────────────────────────────────────────
     _PSM_CONFIGS = [
-        "--oem 3 --psm 6",   # uniform block of text
         "--oem 3 --psm 11",  # sparse text — best for UI screenshots
+        "--oem 3 --psm 6",   # uniform block of text
     ]
     _VARIANT_LABELS = [
         "gray",
@@ -351,7 +401,6 @@ def extract_ocr_result(
         logger.error("Failed to build image variants (details suppressed for privacy).")
         raise RuntimeError("OCR preprocessing failed.") from exc
 
-    best_text: str = ""
     best_score: float = -1.0
     best_label: str = "none"
     best_variant_img: Image.Image = image
@@ -364,7 +413,6 @@ def extract_ocr_result(
             text, score = _run_ocr(variant_img, cfg, lang)
             if score > best_score:
                 best_score = score
-                best_text = text
                 best_label = label
                 best_variant_img = variant_img
                 best_cfg = cfg
@@ -372,18 +420,17 @@ def extract_ocr_result(
     # If every variant scored 0, fall back to the standard preprocess_image path
     if best_score <= 0.0:
         fallback_img = preprocess_image(image)
-        best_text, _ = _run_ocr(fallback_img, tesseract_config, lang)
-        best_label = "fallback(preprocess_image)"
         best_variant_img = fallback_img
         best_cfg = tesseract_config
+        best_label = "fallback(preprocess_image)"
 
-    words = _extract_words(best_variant_img, lang=lang, config_str=best_cfg)
+    # Extract words and synchronized text from the winning variant in a single pass
+    best_text, words = _extract_words_and_text(best_variant_img, lang=lang, config_str=best_cfg)
 
     # ── Coordinate normalisation ──────────────────────────────────────────────
-    # _extract_words returns pixel coordinates in the space of best_variant_img,
-    # which may have been upscaled relative to the original *image*.  Divide all
-    # bounding-box values by the scale factor so callers (e.g. redaction.py)
-    # can work directly in the original image's coordinate space.
+    # _extract_words_and_text returns pixel coordinates in the space of best_variant_img,
+    # which may have been upscaled relative to the original *image*. Divide bounding-box
+    # values by the scale factor while preserving exact text offsets (start, end).
     orig_w, orig_h = image.size
     var_w, var_h = best_variant_img.size
     if var_w != orig_w or var_h != orig_h:
@@ -398,6 +445,8 @@ def extract_ocr_result(
                 height=max(1, round(w.height * scale_y)),
                 line_num=w.line_num,
                 block_num=w.block_num,
+                start=w.start,
+                end=w.end,
             )
             for w in words
         ]
