@@ -101,10 +101,9 @@ class TestRedactImageEndpoint:
         img = _open_png_from_response(resp.data)
         assert img.format == "PNG"
 
-    def test_default_method_is_blur(self, client):
-        """Omitting ?method= should default to blur (200 + PNG returned)."""
+    def test_default_method_is_blackbox(self, client):
+        """Omitting ?method= should default to blackbox (200 + PNG returned)."""
         resp = _post_redact(client, _make_png_bytes(), "img.png", method=None)
-        # If blur works, we get 200 PNG; if there were some error it would 500.
         assert resp.status_code == 200
         assert "image/png" in resp.content_type
 

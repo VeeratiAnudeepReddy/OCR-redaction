@@ -201,11 +201,10 @@ def redact_image() -> tuple[Response, int]:
         multipart/form-data with field ``image``.
 
     Query Parameters:
-        method: ``"blur"`` (default) or ``"blackbox"``.
+        method: ``"blackbox"`` (default) or ``"blur"``.
+            - ``blackbox`` — Solid black rectangle drawn over PII regions (default).
             - ``blur``     — Gaussian blur applied over PII regions; rest of
                              image is pixel-for-pixel unchanged.
-            - ``blackbox`` — Solid black rectangle drawn over PII regions
-                             (legacy behaviour, preserved as fallback).
 
     Returns:
         200: PNG image with redacted regions (Content-Type: image/png)

@@ -2,8 +2,8 @@
 backend/redaction.py — Visual PII redaction of PIL images.
 
 Two methods are supported:
-  - "blur"     : Gaussian blur over detected PII regions (default)
-  - "blackbox" : Solid black rectangle (legacy behaviour)
+  - "blackbox" : Solid black rectangle (default)
+  - "blur"     : Gaussian blur over detected PII regions
 
 Privacy guarantees:
   * Raw OCR text is NEVER logged.
@@ -37,12 +37,12 @@ REDACTION_PADDING_PX: int = 5
 #: Radius 15 produces heavy blur; increase to 20+ for very small text.
 BLUR_RADIUS: int = 15
 
-#: Colour used for the blackbox fallback method.
+#: Colour used for the blackbox method.
 BLACKBOX_FILL: Tuple[int, int, int] = (0, 0, 0)
 
 #: Valid redaction method identifiers.
 VALID_METHODS = {"blur", "blackbox"}
-DEFAULT_METHOD = "blur"
+DEFAULT_METHOD = "blackbox"
 
 
 # ---------------------------------------------------------------------------
